@@ -545,7 +545,7 @@
     #queue-viewport::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
     #music-scroll {
       display: flex;
-      gap: 4px;  /* match #queue-scroll gap to keep timelines aligned */
+      gap: 0;
       min-width: max-content;
       padding-bottom: 2px;
       height: 22px;
@@ -2136,7 +2136,7 @@ function totalVideoDuration() {
   return totalSecs;
 }
 
-function updateDayMarkers(pxPerSec) {
+function updateDayMarkers() {
   const container = el('music-day-markers');
   const lbl = el('music-markers-label');
   if (!container) return;
@@ -2152,7 +2152,7 @@ function updateDayMarkers(pxPerSec) {
   boundaries.forEach(b => {
     const marker = document.createElement('div');
     marker.className = 'music-day-marker';
-    marker.style.left = Math.round(b.secs * pxPerSec) + 'px';
+    marker.style.left = Math.round(filmSecToStripPx(b.secs)) + 'px';
     const line = document.createElement('div');
     line.className = 'music-day-marker-line';
     const label = document.createElement('div');
@@ -2167,35 +2167,33 @@ function updateDayMarkers(pxPerSec) {
 function updateMusicBar() {
   if (!state.musicTracks.length) return;
 
-  // Scale: 1 clip tile = clipDuration s = PX_PER_3S px → pxPerSec = PX_PER_3S / clipDuration
-  const pxPerSec = PX_PER_3S / state.clipDuration;
-
-  let cumPos = 0;  // absolute film position (seconds) at start of current track
+  let cumFilmSec = 0;
   let musicTotal = 0;
   state.musicTracks.forEach((track, i) => {
     const div    = el(`music-${i}`);
     const spacer = el(`music-offset-${i}`);
     if (!div) return;
-    const offset = track.track_offset ?? 0;
+    const offset       = track.track_offset ?? 0;
     const effectiveDur = trackEffectiveDur(track);
-    const absStart = cumPos + offset;
-    const absEnd   = absStart + effectiveDur;
+    const absStart     = cumFilmSec + offset;
+    const absEnd       = absStart + effectiveDur;
+
     if (spacer) {
-      const sw = Math.round(offset * pxPerSec);
+      const sw = Math.round(filmSecToStripPx(cumFilmSec + offset) - filmSecToStripPx(cumFilmSec));
       spacer.style.width   = sw + 'px';
       spacer.style.display = sw > 0 ? 'flex' : 'none';
     }
-    const w = Math.max(8, Math.round(effectiveDur * pxPerSec));
+    const w = Math.max(8, Math.round(filmSecToStripPx(absEnd) - filmSecToStripPx(absStart)));
     div.style.width = w + 'px';
     updateMusicBlockTitle(div, track, absStart, absEnd);
     const posLbl = el(`music-pos-${i}`);
     if (posLbl) posLbl.textContent = `${fmtMinSec(absStart)} · ${filmPositionInfo(absStart)}`;
-    cumPos     += offset + effectiveDur;
+    cumFilmSec += offset + effectiveDur;
     musicTotal += offset + effectiveDur;
   });
 
   // Update day boundary markers row
-  updateDayMarkers(pxPerSec);
+  updateDayMarkers();
 
   // Update total duration display on stats
   const totalDur = totalVideoDuration();
@@ -2211,7 +2209,7 @@ function updateMusicBar() {
   if (gapEl) {
     const remaining = totalDur - musicTotal;
     if (remaining > 1) {
-      const gapW = Math.round(remaining * pxPerSec);
+      const gapW = Math.round(filmSecToStripPx(musicTotal + remaining) - filmSecToStripPx(musicTotal));
       gapEl.style.display = 'flex';
       gapEl.style.width = gapW + 'px';
       gapEl.textContent = `+${remaining.toFixed(0)}s silence`;
@@ -2304,6 +2302,90 @@ function updateMusicBlockTitle(div, track, absStart, absEnd) {
     `Duration: ${effectiveDur.toFixed(1)}s${trimmed ? ' / ' + track.duration.toFixed(1) + 's total' : ''}`;
 }
 
+// ── Strip-px ↔ film-sec mapping ──────────────────────────────────────────────
+// Builds a list of segments describing the strip tile layout and their film-time equivalents.
+// phantom=true means the tile appears in the strip (when showSkipped=true) but has no film time.
+function buildStripLayout() {
+  const showSkipped  = !!(el('show-skipped-cb')?.checked);
+  const showDayCards = !!(el('day-cards-cb')?.checked);
+  const enabledDays  = daysWithEnabledClips();
+  const GAP = 4;
+  const segs = [];
+  let filmSec = 0, stripPx = 0;
+
+  function push(filmDur, tileW, phantom) {
+    segs.push({ filmStart: filmSec, filmEnd: filmSec + filmDur,
+                stripStart: stripPx, stripEnd: stripPx + tileW, phantom });
+    filmSec += filmDur;
+    stripPx += tileW + GAP;
+  }
+
+  if (state.projectTitle) push(4, 48, false);
+
+  let lastDay = null, isFirstDay = true;
+  state.clips.forEach((clip, i) => {
+    const day = clipDay(clip);
+    const sel = state.selections[clip.filename];
+    if (day && day !== lastDay) {
+      const hasEnabled = enabledDays.has(day);
+      const prevDot = i > 0 && state.clips[i - 1].modified > clip.modified;
+      const nextDot = i < state.clips.length - 1 && clip.modified > state.clips[i + 1].modified;
+      if (showDayCards && hasEnabled && (!isFirstDay || !state.projectTitle) && !prevDot && !nextDot) {
+        const dd = state.disabledDayCards.has(day);
+        if (showSkipped || !dd) push(dd ? 0 : 2, 24, dd);
+      }
+      lastDay = day; isFirstDay = false;
+    }
+    if (sel?.enabled) {
+      const n = 1 + (sel.extra_starts || []).length;
+      push(state.clipDuration * n, 36, false);
+    } else if (showSkipped) {
+      push(0, 36, true);
+    }
+  });
+  return segs;
+}
+
+function filmSecToStripPx(filmSec) {
+  const segs = buildStripLayout();
+  let lastNonPhantom = null;
+  for (const s of segs) {
+    if (s.phantom) continue;
+    if (filmSec < s.filmEnd) {
+      // filmSec is within or before this segment
+      if (filmSec < s.filmStart) return s.stripStart;
+      const f = (s.filmEnd > s.filmStart) ? (filmSec - s.filmStart) / (s.filmEnd - s.filmStart) : 0;
+      return s.stripStart + f * (s.stripEnd - s.stripStart);
+    }
+    lastNonPhantom = s;
+  }
+  // filmSec is at or past the end of all segments (e.g. during end card)
+  if (lastNonPhantom) {
+    return lastNonPhantom.stripEnd + (filmSec - lastNonPhantom.filmEnd) * (PX_PER_3S / state.clipDuration);
+  }
+  return filmSec * (PX_PER_3S / state.clipDuration);
+}
+
+function stripPxToFilmSec(stripPx) {
+  const segs = buildStripLayout();
+  let lastSeg = null;
+  for (const s of segs) {
+    if (stripPx < s.stripStart) {
+      // In the gap before this segment — map to its film start
+      return s.filmStart;
+    }
+    if (stripPx <= s.stripEnd) {
+      if (s.phantom) return s.filmStart;  // phantom region has no film time
+      const f = (s.stripEnd > s.stripStart) ? (stripPx - s.stripStart) / (s.stripEnd - s.stripStart) : 0;
+      return s.filmStart + f * (s.filmEnd - s.filmStart);
+    }
+    lastSeg = s;
+  }
+  // Beyond last segment (end card area)
+  if (lastSeg) return lastSeg.filmEnd + (stripPx - lastSeg.stripEnd) / (PX_PER_3S / state.clipDuration);
+  return stripPx / (PX_PER_3S / state.clipDuration);
+}
+
 // ── Music track-end drag ──────────────────────────────────────────────────────
 // Returns sorted list of cumulative video time boundaries (seconds) for snap targets:
 // each clip boundary + day card boundaries.
@@ -2351,10 +2433,8 @@ function bindMusicDragHandle(handle, trackIdx) {
   handle.addEventListener('mousedown', e => {
     e.preventDefault();
     e.stopPropagation();
-    const pxPerSec = PX_PER_3S / state.clipDuration;
-    const snapTargets = videoBoundaries();  // cumulative seconds
 
-    // Compute where this track's audio starts in the film timeline
+    // Compute this track's audio start in film time
     let trackStartSec = 0;
     for (let j = 0; j < trackIdx; j++) {
       const t = state.musicTracks[j];
@@ -2362,28 +2442,26 @@ function bindMusicDragHandle(handle, trackIdx) {
     }
     trackStartSec += state.musicTracks[trackIdx].track_offset ?? 0;
 
-    const startX = e.clientX;
-    const track  = state.musicTracks[trackIdx];
+    const track   = state.musicTracks[trackIdx];
     const origEnd = track.track_end != null ? track.track_end : track.duration;
+    const origEndStripPx = filmSecToStripPx(trackStartSec + origEnd);
+    // Snap targets in strip-px space
+    const snapTargets = videoBoundaries().map(sec => filmSecToStripPx(sec));
+
+    const startX = e.clientX;
     const div = el(`music-${trackIdx}`);
     div.classList.add('dragging');
 
     function onMove(e2) {
-      const dx = e2.clientX - startX;
-      const deltaSec = dx / pxPerSec;
-      let newEnd = Math.max(1, Math.min(track.duration, origEnd + deltaSec));
+      let newEndStripPx = origEndStripPx + (e2.clientX - startX);
 
-      // Snap to video boundaries within 5px
-      const snapPx = 5 / pxPerSec;
-      const absoluteEnd = trackStartSec + newEnd;
+      // Snap within 5px
       for (const b of snapTargets) {
-        if (Math.abs(absoluteEnd - b) <= snapPx) {
-          newEnd = Math.max(1, Math.min(track.duration, b - trackStartSec));
-          break;
-        }
+        if (Math.abs(newEndStripPx - b) <= 5) { newEndStripPx = b; break; }
       }
 
-      track.track_end = newEnd;
+      const newEndFilmSec = stripPxToFilmSec(newEndStripPx);
+      track.track_end = Math.max(1, Math.min(track.duration, newEndFilmSec - trackStartSec));
       updateMusicBar();
     }
 
@@ -2403,34 +2481,33 @@ function bindMusicDragHandleLeft(handle, trackIdx) {
   handle.addEventListener('mousedown', e => {
     e.preventDefault();
     e.stopPropagation();
-    const pxPerSec   = PX_PER_3S / state.clipDuration;
-    const snapTargets = videoBoundaries();
 
-    // Cumulative end of all previous tracks in the timeline
-    let prevEnd = 0;
+    // Cumulative end of all previous tracks in film time
+    let prevEndFilmSec = 0;
     for (let j = 0; j < trackIdx; j++) {
       const t = state.musicTracks[j];
-      prevEnd += (t.track_offset ?? 0) + trackEffectiveDur(t);
+      prevEndFilmSec += (t.track_offset ?? 0) + trackEffectiveDur(t);
     }
+    const prevEndStripPx = filmSecToStripPx(prevEndFilmSec);
 
-    const startX      = e.clientX;
-    const track       = state.musicTracks[trackIdx];
-    const origOffset  = track.track_offset ?? 0;
-    const blockDiv    = el(`music-${trackIdx}`);
+    const track      = state.musicTracks[trackIdx];
+    const origOffset = track.track_offset ?? 0;
+    const origStartStripPx = filmSecToStripPx(prevEndFilmSec + origOffset);
+    const snapTargets = videoBoundaries().map(sec => filmSecToStripPx(sec));
+
+    const startX   = e.clientX;
+    const blockDiv = el(`music-${trackIdx}`);
     if (blockDiv) blockDiv.classList.add('dragging');
 
     function onMove(e2) {
-      const dx = e2.clientX - startX;
-      const deltaSec = dx / pxPerSec;
-      let newOffset = Math.max(0, origOffset + deltaSec);
+      let newStartStripPx = Math.max(prevEndStripPx, origStartStripPx + (e2.clientX - startX));
 
-      // Snap the left edge of this block to video boundaries
-      const snapPx = 5 / pxPerSec;
-      const absLeft = prevEnd + newOffset;
+      // Snap within 5px
       for (const b of snapTargets) {
-        if (Math.abs(absLeft - b) <= snapPx) { newOffset = Math.max(0, b - prevEnd); break; }
+        if (Math.abs(newStartStripPx - b) <= 5) { newStartStripPx = Math.max(prevEndStripPx, b); break; }
       }
 
+      const newOffset = Math.max(0, stripPxToFilmSec(newStartStripPx) - prevEndFilmSec);
       track.track_offset = newOffset < 0.05 ? 0 : newOffset;
       updateMusicBar();
     }
@@ -2763,6 +2840,7 @@ function bindShowSkipped() {
   cb.addEventListener('change', () => {
     localStorage.setItem('clipcutter_show_skipped', cb.checked ? '1' : '0');
     renderQueue();
+    updateMusicBar();
   });
 }
 
