@@ -617,6 +617,42 @@
       white-space: nowrap;
       opacity: 0.6;
     }
+    .music-pos-label {
+      font-size: 9px;
+      color: rgba(255,255,255,0.45);
+      margin-left: 8px;
+      white-space: nowrap;
+      overflow: hidden;
+      flex-shrink: 1;
+      pointer-events: none;
+    }
+    #music-day-markers {
+      position: relative;
+      height: 16px;
+      min-width: max-content;
+      display: none;
+    }
+    .music-day-marker {
+      position: absolute;
+      top: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      pointer-events: none;
+      transform: translateX(-50%);
+    }
+    .music-day-marker-line {
+      width: 1px;
+      height: 6px;
+      background: rgba(255,200,80,0.6);
+      margin-left: 50%;
+    }
+    .music-day-marker-label {
+      font-size: 8px;
+      color: rgba(255,200,80,0.75);
+      white-space: nowrap;
+      line-height: 1.2;
+    }
 
     /* ── Queue card tiles (intro / day / end) ─────────────────── */
     .q-card {
@@ -664,6 +700,7 @@
       text-overflow: ellipsis;
       display: block;
       pointer-events: none;
+      flex-shrink: 0;
     }
 
     /* ── Frame preview panels ─────────────────────────────────── */
@@ -735,6 +772,14 @@
       text-align: center;
     }
     #card-preview-title {
+      font-size: clamp(14px, 3.5vw, 26px);
+      font-weight: bold;
+      color: #fff;
+      text-align: center;
+      word-break: break-word;
+      line-height: 1.25;
+    }
+    #card-preview-title2 {
       font-size: clamp(14px, 3.5vw, 26px);
       font-weight: bold;
       color: #fff;
@@ -853,6 +898,7 @@
   <div id="day-title-modal-box">
     <div class="modal-label" id="day-title-modal-label">Day card: <strong id="day-title-modal-date"></strong></div>
     <input type="text" id="day-title-input" placeholder="Title" maxlength="60" autocomplete="off">
+    <input type="text" id="day-title2-input" placeholder="Title line 2 (optional, title card only)" maxlength="60" autocomplete="off" style="display:none">
     <input type="text" id="day-subtitle-input" placeholder="Subtitle" maxlength="60" autocomplete="off">
     <div class="modal-btns">
       <button class="btn" onclick="resetCardTitle()">Reset</button>
@@ -903,6 +949,7 @@
       <div id="card-preview" style="display:none">
         <div id="card-preview-label"></div>
         <div id="card-preview-title"></div>
+        <div id="card-preview-title2" style="display:none"></div>
         <div id="card-preview-subtitle"></div>
         <div id="card-preview-btns" style="display:none">
           <button class="btn" id="card-preview-toggle-btn" onclick="toggleDayCardFromPreview()">✗ Skip</button>
@@ -1022,10 +1069,12 @@
           <div id="timeline-labels">
             <div class="timeline-label">&#127916; Clips:</div>
             <div class="timeline-label" id="music-label">&#9835; Music:</div>
+            <div class="timeline-label" id="music-markers-label" style="height:16px;display:none"></div>
           </div>
           <div id="queue-viewport">
             <div id="queue-scroll"></div>
             <div id="music-scroll"></div>
+            <div id="music-day-markers"></div>
           </div>
         </div>
         <div id="queue-footer">
@@ -1084,6 +1133,7 @@ const state = {
   exportPolling: null,
   folder: '',
   projectTitle: '',
+  projectTitle2: '',
   projectSubtitle: '',
   lastExportName: '',
   exportStartTime: null,
@@ -1150,6 +1200,7 @@ async function init() {
   if (s.loaded) {
     state.folder          = s.folder          || '';
     state.projectTitle    = s.title           || '';
+    state.projectTitle2   = s.title2          || '';
     state.projectSubtitle = s.subtitle        || '';
     state.endCardTitle    = s.end_card_title  || '';
     state.endCardSubtitle = s.end_card_subtitle || '';
@@ -1181,6 +1232,7 @@ async function loadFolder() {
     const s = await api('GET', '/api/state');
     state.folder          = s.folder             || '';
     state.projectTitle    = s.title              || '';
+    state.projectTitle2   = s.title2             || '';
     state.projectSubtitle = s.subtitle           || '';
     state.endCardTitle    = s.end_card_title     || '';
     state.endCardSubtitle = s.end_card_subtitle  || '';
@@ -1523,6 +1575,11 @@ function updateCardPreview() {
   if (card.type === 'intro') {
     el('card-preview-label').textContent    = 'TITLE CARD';
     el('card-preview-title').textContent    = state.projectTitle    || '(no title set)';
+    const t2El = el('card-preview-title2');
+    if (t2El) {
+      t2El.textContent  = state.projectTitle2 || '';
+      t2El.style.display = state.projectTitle2 ? '' : 'none';
+    }
     el('card-preview-subtitle').textContent = state.projectSubtitle || '';
     el('card-preview-btns').style.display   = 'flex';
     toggleBtn.style.display = 'none';
@@ -2027,13 +2084,17 @@ function renderMusicBar() {
     nameEl.className = 'music-name';
     nameEl.textContent = name;
     div.appendChild(nameEl);
+    const posLbl = document.createElement('span');
+    posLbl.id = `music-pos-${i}`;
+    posLbl.className = 'music-pos-label';
+    div.appendChild(posLbl);
     // Drag handle on right edge to trim track_end
     const handle = document.createElement('div');
     handle.className = 'music-drag-handle';
     handle.title = 'Drag to trim track end';
     bindMusicDragHandle(handle, i);
     div.appendChild(handle);
-    updateMusicBlockTitle(div, track);
+    updateMusicBlockTitle(div, track, 0, 0);
     container.appendChild(div);
   });
 
@@ -2075,12 +2136,41 @@ function totalVideoDuration() {
   return totalSecs;
 }
 
+function updateDayMarkers(pxPerSec) {
+  const container = el('music-day-markers');
+  const lbl = el('music-markers-label');
+  if (!container) return;
+  const boundaries = dayBoundaryPositions();
+  if (!boundaries.length) {
+    container.style.display = 'none';
+    if (lbl) lbl.style.display = 'none';
+    return;
+  }
+  container.style.display = 'block';
+  if (lbl) lbl.style.display = '';
+  container.innerHTML = '';
+  boundaries.forEach(b => {
+    const marker = document.createElement('div');
+    marker.className = 'music-day-marker';
+    marker.style.left = Math.round(b.secs * pxPerSec) + 'px';
+    const line = document.createElement('div');
+    line.className = 'music-day-marker-line';
+    const label = document.createElement('div');
+    label.className = 'music-day-marker-label';
+    label.textContent = b.label;
+    marker.appendChild(line);
+    marker.appendChild(label);
+    container.appendChild(marker);
+  });
+}
+
 function updateMusicBar() {
   if (!state.musicTracks.length) return;
 
   // Scale: 1 clip tile = clipDuration s = PX_PER_3S px → pxPerSec = PX_PER_3S / clipDuration
   const pxPerSec = PX_PER_3S / state.clipDuration;
 
+  let cumPos = 0;  // absolute film position (seconds) at start of current track
   let musicTotal = 0;
   state.musicTracks.forEach((track, i) => {
     const div    = el(`music-${i}`);
@@ -2088,6 +2178,8 @@ function updateMusicBar() {
     if (!div) return;
     const offset = track.track_offset ?? 0;
     const effectiveDur = trackEffectiveDur(track);
+    const absStart = cumPos + offset;
+    const absEnd   = absStart + effectiveDur;
     if (spacer) {
       const sw = Math.round(offset * pxPerSec);
       spacer.style.width   = sw + 'px';
@@ -2095,9 +2187,15 @@ function updateMusicBar() {
     }
     const w = Math.max(8, Math.round(effectiveDur * pxPerSec));
     div.style.width = w + 'px';
-    updateMusicBlockTitle(div, track);
+    updateMusicBlockTitle(div, track, absStart, absEnd);
+    const posLbl = el(`music-pos-${i}`);
+    if (posLbl) posLbl.textContent = `${fmtMinSec(absStart)} · ${filmPositionInfo(absStart)}`;
+    cumPos     += offset + effectiveDur;
     musicTotal += offset + effectiveDur;
   });
+
+  // Update day boundary markers row
+  updateDayMarkers(pxPerSec);
 
   // Update total duration display on stats
   const totalDur = totalVideoDuration();
@@ -2130,12 +2228,80 @@ function trackEffectiveDur(track) {
   return Math.max(1, end);
 }
 
-function updateMusicBlockTitle(div, track) {
+// Returns "Day 2 · clip #47", "day card 2", "title card", or "end card"
+function filmPositionInfo(absSecs) {
+  const showDayCards = el('day-cards-cb') && el('day-cards-cb').checked;
+  let t = 0;
+  let totalClip = 0;
+  let dayNum = 0;
+
+  if (state.projectTitle) {
+    if (absSecs < t + 4) return 'title card';
+    t += 4;
+  }
+
+  let lastDay = null, isFirstDay = true;
+  for (const clip of state.clips) {
+    const sel = state.selections[clip.filename];
+    if (!sel || !sel.enabled) continue;
+    const day = clipDay(clip);
+    if (day !== lastDay) {
+      dayNum++;
+      if (showDayCards && !state.disabledDayCards.has(day) && (!isFirstDay || !state.projectTitle)) {
+        if (absSecs < t + 2) return `day card ${dayNum}`;
+        t += 2;
+      }
+      lastDay = day; isFirstDay = false;
+    }
+    const nSlots = 1 + (sel.extra_starts || []).length;
+    const dur = state.clipDuration * nSlots;
+    if (absSecs < t + dur) {
+      const localSlot = Math.floor((absSecs - t) / state.clipDuration);
+      return `day ${dayNum} · clip #${totalClip + localSlot + 1}`;
+    }
+    t += dur;
+    totalClip += nSlots;
+  }
+  return 'end card';
+}
+
+// Returns [{secs, label}] for each day card boundary (where day cards appear in the film)
+function dayBoundaryPositions() {
+  const showDayCards = el('day-cards-cb') && el('day-cards-cb').checked;
+  if (!showDayCards) return [];
+  const result = [];
+  let t = 0;
+  let dayNum = 0;
+
+  if (state.projectTitle) t += 4;
+
+  let lastDay = null, isFirstDay = true;
+  for (const clip of state.clips) {
+    const sel = state.selections[clip.filename];
+    if (!sel || !sel.enabled) continue;
+    const day = clipDay(clip);
+    if (day !== lastDay) {
+      dayNum++;
+      if (!state.disabledDayCards.has(day) && (!isFirstDay || !state.projectTitle)) {
+        result.push({ secs: t, label: `Day ${dayNum}` });
+        t += 2;
+      }
+      lastDay = day; isFirstDay = false;
+    }
+    t += state.clipDuration * (1 + (sel.extra_starts || []).length);
+  }
+  return result;
+}
+
+function updateMusicBlockTitle(div, track, absStart, absEnd) {
   const effectiveDur = trackEffectiveDur(track);
-  const offset = track.track_offset ?? 0;
   const trimmed = effectiveDur < track.duration - 0.5;
-  const offsetStr = offset > 0.5 ? ` starts at ${offset.toFixed(1)}s` : '';
-  div.title = `${track.filename}  (${effectiveDur.toFixed(1)}s${offsetStr}${trimmed ? ' / ' + track.duration.toFixed(1) + 's total' : ''})`;
+  const startInfo = filmPositionInfo(absStart);
+  const endInfo   = filmPositionInfo(absEnd);
+  div.title = `${track.filename}\n` +
+    `Starts: ${fmtMinSec(absStart)}  (${startInfo})\n` +
+    `Ends:   ${fmtMinSec(absEnd)}  (${endInfo})\n` +
+    `Duration: ${effectiveDur.toFixed(1)}s${trimmed ? ' / ' + track.duration.toFixed(1) + 's total' : ''}`;
 }
 
 // ── Music track-end drag ──────────────────────────────────────────────────────
@@ -2330,8 +2496,9 @@ async function exportFilm() {
   let r;
   try {
     r = await api('POST', '/api/export', {
-      title:            state.projectTitle,
-      subtitle:         state.projectSubtitle,
+      title:             state.projectTitle,
+      title2:            state.projectTitle2,
+      subtitle:          state.projectSubtitle,
       include_day_cards: el('day-cards-cb').checked,
     });
   } catch (e) {
@@ -2660,7 +2827,10 @@ function openCardEditor(mode, dateStr) {
   const label    = el('day-title-modal-label');
   const dateEl   = el('day-title-modal-date');
   const titleIn  = el('day-title-input');
+  const title2In = el('day-title2-input');
   const subIn    = el('day-subtitle-input');
+
+  title2In.style.display = 'none';
 
   if (mode === 'day') {
     _editingCard = 'day:' + dateStr;
@@ -2673,10 +2843,13 @@ function openCardEditor(mode, dateStr) {
   } else if (mode === 'intro') {
     _editingCard = 'intro';
     label.innerHTML = 'Title card';
-    titleIn.placeholder = 'Title';
+    titleIn.placeholder = 'Title line 1';
+    title2In.placeholder = 'Title line 2 (optional)';
+    title2In.style.display = '';
     subIn.placeholder   = 'Subtitle';
-    titleIn.value = state.projectTitle    || '';
-    subIn.value   = state.projectSubtitle || '';
+    titleIn.value  = state.projectTitle  || '';
+    title2In.value = state.projectTitle2 || '';
+    subIn.value    = state.projectSubtitle || '';
   } else if (mode === 'end') {
     _editingCard = 'end';
     label.innerHTML = 'End card';
@@ -2700,6 +2873,7 @@ function closeCardModal() {
 function saveCardTitleFromModal() {
   const editing  = _editingCard;
   const title    = el('day-title-input').value.trim();
+  const title2   = (el('day-title2-input').value || '').trim();
   const subtitle = el('day-subtitle-input').value.trim();
   closeCardModal();
 
@@ -2714,8 +2888,9 @@ function saveCardTitleFromModal() {
 
   } else if (editing === 'intro') {
     state.projectTitle    = title;
+    state.projectTitle2   = title2;
     state.projectSubtitle = subtitle;
-    api('POST', '/api/settings', { title, subtitle })
+    api('POST', '/api/settings', { title, title2, subtitle })
       .catch(e => console.error('settings save error:', e));
 
   } else if (editing === 'end') {

@@ -45,6 +45,7 @@ state = {
     'clips': [],               # [{id, filename, duration, modified, width, height}]
     'selections': {},          # filename -> {filename, start_time, enabled}
     'title': '',
+    'title2': '',
     'subtitle': '',
     'music': [],               # [{filename, duration}]
     'disabled_day_cards': set(),   # set of date strings 'YYYY-MM-DD'
@@ -284,9 +285,9 @@ def _clip_cache_path(folder, filename, start_time, clip_duration=3.0):
     return os.path.join(cache_dir, f'{stem}_{mtime_ms}_{start_ms:09d}_{dur_ms}ms.mp4')
 
 
-def _title_card_cache_path(folder, title, subtitle):
-    """Return cache path for a title card keyed by title+subtitle content."""
-    h = hashlib.md5(f'{title}|{subtitle}'.encode()).hexdigest()[:12]
+def _title_card_cache_path(folder, title, subtitle, title2=''):
+    """Return cache path for a title card keyed by title+title2+subtitle content."""
+    h = hashlib.md5(f'{title}|{title2}|{subtitle}'.encode()).hexdigest()[:12]
     return os.path.join(folder, '.clip_cache', f'title_{h}.mp4')
 
 
@@ -338,7 +339,7 @@ DAYS_PL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', '
 
 
 def load_selections(folder):
-    """Returns (selections_dict, title, subtitle, disabled_day_cards, day_card_titles,
+    """Returns (selections_dict, title, subtitle, title2, disabled_day_cards, day_card_titles,
     end_card_title, end_card_subtitle, music_ends, music_offsets, clip_order, clip_duration, has_saved).
     music_ends: dict filename->track_end_seconds.
     music_offsets: dict filename->track_offset_seconds (silence before track in film timeline).
@@ -360,20 +361,21 @@ def load_selections(folder):
                 music_offsets = data.get('music_offsets', data.get('music_starts', {}))  # back-compat
                 clip_order    = data.get('clip_order', [])
                 clip_dur      = float(data.get('clip_duration', 3.0))
-                return (sel, data.get('title', ''), data.get('subtitle', ''),
+                return (sel, data.get('title', ''), data.get('subtitle', ''), data.get('title2', ''),
                         disabled, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, True)
         except Exception as e:
             print(f'Load selections error: {e}')
-    return {}, '', '', set(), {}, '', '', {}, {}, [], 3.0, False
+    return {}, '', '', '', set(), {}, '', '', {}, {}, [], 3.0, False
 
 
-def save_selections(folder, selections, title='', subtitle='', disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', music_ends=None, music_offsets=None, clip_order=None, clip_duration=3.0):
+def save_selections(folder, selections, title='', subtitle='', disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', music_ends=None, music_offsets=None, clip_order=None, clip_duration=3.0, title2=''):
     path = os.path.join(folder, 'selections.json')
     data = {
         'source_folder': folder,
         'created': datetime.datetime.now().isoformat(),
         'clip_duration': clip_duration,
         'title': title,
+        'title2': title2,
         'subtitle': subtitle,
         'selections': list(selections.values()),
         'disabled_day_cards': sorted(disabled_day_cards or []),
@@ -506,7 +508,7 @@ def find_icon_font():
     return None
 
 
-def generate_title_card(title, subtitle, out_path):
+def generate_title_card(title, subtitle, out_path, title2=''):
     """Generate 4-second title card MP4 (1080x1920).
     Play icon visible 0-1s, title+subtitle visible 0-3s (static, no animation).
     Returns out_path on success, or None on failure."""
@@ -526,20 +528,31 @@ def generate_title_card(title, subtitle, out_path):
     # Segoe UI Symbol / MDL2 have ⏵ (U+23F5); everything else uses ▶ (U+25B6)
     icon_char  = '\u23f5' if ('seguisym' in name_lower or 'segmdl2' in name_lower) else '\u25b6'
 
-    title_esc = esc_drawtext(title)
+    title_esc  = esc_drawtext(title)
+    has_title2 = bool(title2.strip())
+
+    # Two title lines: shift block up so it stays centred vertically in the frame
+    title_y    = 970  if has_title2 else 1020
+    subtitle_y = 1190 if has_title2 else 1140
 
     # \, inside enable= escapes the comma so it's not treated as a filter separator
     vf_parts = [
         f"drawtext=fontfile={icon_name}:text={icon_char}:fontsize=320:"
         f"fontcolor=white:x=(w-tw)/2:y=580:enable=lt(t\\,1)",
         f"drawtext=fontfile={text_name}:text={title_esc}:fontsize=90:"
-        f"fontcolor=white:x=(w-tw)/2:y=1020:enable=lt(t\\,3)",
+        f"fontcolor=white:x=(w-tw)/2:y={title_y}:enable=lt(t\\,3)",
     ]
+    if has_title2:
+        title2_esc = esc_drawtext(title2.strip())
+        vf_parts.append(
+            f"drawtext=fontfile={text_name}:text={title2_esc}:fontsize=90:"
+            f"fontcolor=white:x=(w-tw)/2:y={title_y + 105}:enable=lt(t\\,3)"
+        )
     if subtitle.strip():
         sub_esc = esc_drawtext(subtitle.strip())
         vf_parts.append(
             f"drawtext=fontfile={text_name}:text={sub_esc}:fontsize=60:"
-            f"fontcolor=white:x=(w-tw)/2:y=1140:enable=lt(t\\,3)"
+            f"fontcolor=white:x=(w-tw)/2:y={subtitle_y}:enable=lt(t\\,3)"
         )
 
     cmd = [
@@ -774,7 +787,7 @@ def _embed_mp4_thumbnail(video_path, thumb_path):
 
 # ─── Export ───────────────────────────────────────────────────────────────────
 
-def export_worker(folder, clips, selections, out_name, title='', subtitle='', music_tracks=None, include_day_cards=True, disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', clip_duration=3.0):
+def export_worker(folder, clips, selections, out_name, title='', subtitle='', music_tracks=None, include_day_cards=True, disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', clip_duration=3.0, title2=''):
     global export_status, export_cancel, export_proc
 
     def set_status(s, msg, pct, output=None):
@@ -813,13 +826,13 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
     # Title card — check cache first
     title_file = None
     if title:
-        title_cache = _title_card_cache_path(folder, title, subtitle)
+        title_cache = _title_card_cache_path(folder, title, subtitle, title2)
         if os.path.isfile(title_cache):
             print('  [cache] intro card')
             title_file = title_cache
         else:
             set_status('working', 'Generating intro card...', 2)
-            title_file = generate_title_card(title, subtitle, title_cache)
+            title_file = generate_title_card(title, subtitle, title_cache, title2)
 
     cut_clips = []  # list of (date_str, cache_path)
     # Count total slots (primary + duplicates) for progress reporting
@@ -1160,6 +1173,7 @@ class Handler(BaseHTTPRequestHandler):
                     'folder': state['folder'],
                     'count': len(state['clips']),
                     'title': state['title'],
+                    'title2': state['title2'],
                     'subtitle': state['subtitle'],
                     'end_card_title': state['end_card_title'],
                     'end_card_subtitle': state['end_card_subtitle'],
@@ -1272,7 +1286,7 @@ class Handler(BaseHTTPRequestHandler):
             if not clips:
                 self.send_json({'error': 'No MP4 files found in folder'}, 400)
                 return
-            sel, title, subtitle, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
+            sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
             if not has_saved:
                 # First load – apply defaults: title = folder basename, subtitle = date of first clip
                 title = os.path.basename(folder.rstrip('/\\'))
@@ -1296,6 +1310,7 @@ class Handler(BaseHTTPRequestHandler):
                 state['clips']              = clips
                 state['selections']         = sel
                 state['title']              = title
+                state['title2']             = title2
                 state['subtitle']           = subtitle
                 state['music']              = music
                 state['disabled_day_cards'] = disabled_days
@@ -1304,7 +1319,7 @@ class Handler(BaseHTTPRequestHandler):
                 state['end_card_subtitle']  = end_sub
                 state['clip_duration']      = clip_dur
             if not has_saved and folder:
-                save_selections(folder, sel, title, subtitle, disabled_days, day_titles, end_title, end_sub, clip_order=[c['filename'] for c in clips], clip_duration=clip_dur)
+                save_selections(folder, sel, title, subtitle, disabled_days, day_titles, end_title, end_sub, clip_order=[c['filename'] for c in clips], clip_duration=clip_dur, title2=title2)
             print(f'Loaded {len(clips)} clips, {len(sel)} saved decisions, {len(music)} tracks')
             threading.Thread(target=pregenerate_hevc_previews, args=(folder, clips), daemon=True).start()
             self.send_json({'ok': True, 'count': len(clips)})
@@ -1337,9 +1352,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == '/api/settings':
             title    = data.get('title', '').strip()
+            title2   = data.get('title2', '').strip()
             subtitle = data.get('subtitle', '').strip()
             with state_lock:
                 state['title']    = title
+                state['title2']   = title2
                 state['subtitle'] = subtitle
                 folder     = state['folder']
                 sel_copy   = dict(state['selections'])
@@ -1350,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
                 clip_dur   = state['clip_duration']
                 cur_order  = [c['filename'] for c in state['clips']]
             if folder:
-                save_selections(folder, sel_copy, title, subtitle, disabled, day_titles, end_title, end_sub, clip_order=cur_order, clip_duration=clip_dur)
+                save_selections(folder, sel_copy, title, subtitle, disabled, day_titles, end_title, end_sub, clip_order=cur_order, clip_duration=clip_dur, title2=title2)
             self.send_json({'ok': True})
 
         elif path == '/api/export':
@@ -1382,12 +1399,13 @@ class Handler(BaseHTTPRequestHandler):
                 out_name += '.mp4'
 
             title             = data.get('title', '').strip()
+            title2            = data.get('title2', '').strip()
             subtitle          = data.get('subtitle', '').strip()
             include_day_cards = bool(data.get('include_day_cards', True))
 
             t = threading.Thread(
                 target=export_worker,
-                args=(folder, clips, sel, out_name, title, subtitle, music, include_day_cards, disabled_days, day_titles, end_card_title, end_card_subtitle, clip_dur),
+                args=(folder, clips, sel, out_name, title, subtitle, music, include_day_cards, disabled_days, day_titles, end_card_title, end_card_subtitle, clip_dur, title2),
                 daemon=True,
             )
             t.start()
@@ -1847,7 +1865,7 @@ def main():
         if not clips:
             print(f'ERROR: No MP4 files in: {folder}')
             sys.exit(1)
-        sel, title, subtitle, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
+        sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
         if not has_saved:
             title    = os.path.basename(folder.rstrip('/\\'))
             clip_dur = 3.0
@@ -1870,6 +1888,7 @@ def main():
             state['clips']              = clips
             state['selections']         = sel
             state['title']              = title
+            state['title2']             = title2
             state['subtitle']           = subtitle
             state['music']              = music
             state['disabled_day_cards'] = disabled_days

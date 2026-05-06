@@ -1,7 +1,11 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git -C \"c:/Users/karol/git/clip-cutter\" diff HEAD -- server.py)"
+      "Bash(git -C \"c:/Users/karol/git/clip-cutter\" diff HEAD -- server.py)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\karol\\\\git\\\\clip-cutter\" -Recurse -File)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(dir \"C:\\\\Users\\\\karol\\\\git\\\\clip-cutter\")",
+      "Bash(python *)"
     ]
   }
 }
