@@ -269,9 +269,9 @@ def scan_music(folder):
     return tracks
 
 
-def _clip_cache_path(folder, filename, start_time, clip_duration=3.0):
+def _clip_cache_path(folder, filename, start_time, clip_duration=3.0, location_name=''):
     """Return deterministic cache path for a cut clip segment.
-    Includes source-file mtime and clip_duration in the name → automatic invalidation
+    Includes source-file mtime, location_name and clip_duration in the name → automatic invalidation
     if source changes or clip duration changes."""
     cache_dir = os.path.join(folder, '.clip_cache')
     stem      = os.path.splitext(filename)[0]
@@ -282,7 +282,8 @@ def _clip_cache_path(folder, filename, start_time, clip_duration=3.0):
         mtime_ms = 0
     start_ms = int(round(start_time * 1000))
     dur_ms   = int(round(clip_duration * 1000))
-    return os.path.join(cache_dir, f'{stem}_{mtime_ms}_{start_ms:09d}_{dur_ms}ms.mp4')
+    loc_part = f'_{hashlib.md5(location_name.encode()).hexdigest()[:8]}' if location_name else ''
+    return os.path.join(cache_dir, f'{stem}_{mtime_ms}_{start_ms:09d}_{dur_ms}ms{loc_part}.mp4')
 
 
 def _title_card_cache_path(folder, title, subtitle, title2=''):
@@ -469,7 +470,9 @@ def esc_drawtext(s):
              .replace(':', '\\:')
              .replace("'", "\\'")
              .replace('%', '%%')
-             .replace(',', '\\,'))
+             .replace(',', '\\,')
+             .replace('>', '\\>')
+             .replace('<', '\\<'))
 
 
 def _esc_font(path):
@@ -839,6 +842,9 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
     total_slots = sum(1 + len(sel.get('extra_starts') or []) for _, sel in selected)
     slot_idx = 0
 
+    # Find text font once — needed for optional location overlay on any clip
+    location_font = find_text_font()
+
     for clip, sel in selected:
         inp      = os.path.join(folder, clip['filename'])
         # Group by day with 5:00 AM cutoff — clips before 5 AM belong to the previous day
@@ -851,10 +857,11 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
         except Exception:
             clip_day = modified_str[:10]
         starts   = [sel.get('start_time') or 0.0] + [float(t) for t in (sel.get('extra_starts') or [])]
+        location_name = (sel.get('location_name') or '').strip()
 
         for j, start in enumerate(starts):
             label      = clip['filename'] + (f' [{j+1}/{len(starts)}]' if len(starts) > 1 else '')
-            cache_path = _clip_cache_path(folder, clip['filename'], start, clip_duration)
+            cache_path = _clip_cache_path(folder, clip['filename'], start, clip_duration, location_name)
 
             if os.path.isfile(cache_path):
                 print(f'  [cache] {label}')
@@ -879,8 +886,17 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
                 # SDR clip — just ensure correct pixel format, no tone-mapping
                 color_vf = 'format=yuv420p'
             vf = (f'{color_vf},'
-                  'scale=1080:1920:force_original_aspect_ratio=decrease,'
-                  'pad=1080:1920:-1:-1:color=black')
+                  'scale=1080:1920:force_original_aspect_ratio=increase,'
+                  'crop=1080:1920')
+            if location_name and location_font:
+                font_esc = _esc_font(location_font)
+                # single-quoted text: only ' needs escaping ('\'' pattern);
+                # Windows argv doesn't treat ' as special inside outer "..."
+                loc_esc  = location_name.replace("'", "'\\''").replace('%', '%%')
+                vf += (f',drawtext=fontfile=\'{font_esc}\':text=\'{loc_esc}\':'
+                       f'x=30:y=h-th-30:fontcolor=white:fontsize=144:'
+                       f'alpha=0.85:'
+                       f'shadowcolor=black@0.6:shadowx=2:shadowy=2')
             fade_start = max(0.0, clip_duration - 0.3)
             cmd = [
                 FFMPEG, '-y',
@@ -1341,6 +1357,7 @@ class Handler(BaseHTTPRequestHandler):
                     'start_time': data.get('start_time'),
                     'enabled': bool(data.get('enabled', True)),
                     'extra_starts': [float(t) for t in (data.get('extra_starts') or [])],
+                    'location_name': data.get('location_name', ''),
                 }
                 sel_copy   = dict(state['selections'])
                 disabled   = list(state['disabled_day_cards'])

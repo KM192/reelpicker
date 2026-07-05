@@ -358,6 +358,37 @@
     }
     .slot-time { flex: 1; }
     .slot-time.unmarked { color: var(--dim); font-style: italic; }
+    .location-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 6px;
+      padding: 3px 6px;
+      border-top: 1px solid var(--border);
+    }
+    .location-row label {
+      font-size: 10px;
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .location-row input {
+      flex: 1;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--text);
+      font-size: 12px;
+      padding: 2px 6px;
+      outline: none;
+      min-width: 0;
+    }
+    .location-row input:focus {
+      border-color: var(--orange);
+    }
+    .location-row input::placeholder {
+      color: var(--dim);
+      opacity: .5;
+    }
     .slot-remove {
       padding: 0 5px;
       font-size: 12px;
@@ -416,6 +447,7 @@
     .q-item.dragging        { opacity: 0.35; cursor: grabbing; }
     .q-item.drag-over       { outline: 2px solid var(--accent); outline-offset: 1px; }
     .q-item-ooo::after      { content: ''; position: absolute; top: 2px; right: 2px; width: 5px; height: 5px; border-radius: 50%; background: #f5c400; pointer-events: none; }
+    .q-item.has-location::before { content: ''; position: absolute; top: -1px; left: 4px; right: 4px; height: 3px; border-radius: 0 0 2px 2px; background: #f5c400; pointer-events: none; }
     .q-item .q-num  { font-weight: bold; line-height: 1; }
     .q-item .q-icon { font-size: 9px; line-height: 1; }
 
@@ -1035,6 +1067,11 @@
             </label>
           </div>
           <div id="slots-list"></div>
+          <div class="location-row">
+            <label>Location</label>
+            <input type="text" id="location-input" placeholder="e.g. Berlin" maxlength="60"
+                   oninput="onLocationChange(this.value)">
+          </div>
         </div>
         <div id="decision-section">
           <button class="btn btn-green" id="take-btn" onclick="takeClip()" title="Enter">
@@ -1120,7 +1157,7 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
   clips: [],
-  selections: {},           // filename -> {filename, start_time, enabled, extra_starts:[]}
+  selections: {},           // filename -> {filename, start_time, enabled, extra_starts:[], location_name:''}
   previewStatus: {},        // filename -> 'ready'|'working'|'pending'|'error'
   disabledDayCards: new Set(), // set of 'YYYY-MM-DD' strings
   dayCardTitles: {},           // date -> {title, subtitle}
@@ -1385,7 +1422,7 @@ function bindScrubber() {
   document.addEventListener('touchmove', (e) => { if (dragging) seekAt(e.touches[0].clientX); });
   document.addEventListener('touchend',  ()  => { dragging = false; });
 
-  // Left double-click: mark start at clicked position
+  // Left double-click: mark start at clicked position + auto-TAKE
   container.addEventListener('dblclick', (e) => {
     if (e.button !== 0) return;
     const rect = container.getBoundingClientRect();
@@ -1395,9 +1432,10 @@ function bindScrubber() {
     state.markSlots[state.activeSlot] = pct * v.duration;
     updateMarkInfo();
     scheduleFramePreview(0);
+    autoTakeClip();
   });
 
-  // Right double-click: mark end at clicked position → start = end - clipDuration s
+  // Right double-click: mark end at clicked position → start = end - clipDuration s + auto-TAKE
   let _lastRightClick = 0;
   container.addEventListener('contextmenu', (e) => {
     e.preventDefault();
@@ -1415,6 +1453,7 @@ function bindScrubber() {
       updateMarkInfo();
       scheduleFramePreview(0);
       _lastRightClick = 0;
+      autoTakeClip();
     } else {
       _lastRightClick = now;
     }
@@ -1517,6 +1556,7 @@ function goToClip(idx) {
     state.markSlots = [null];
   }
   state.activeSlot = 0;
+  updateLocationInput();
 
   // Kick off frame extraction immediately — doesn't need video metadata
   if (!_playAllMode) updateFramePreviews();
@@ -1589,6 +1629,8 @@ function updateCardPreview() {
     const disabled = state.disabledDayCards.has(card.date);
     el('card-preview-label').textContent    = `DAY CARD  \u2022  ${card.date}`;
     el('card-preview-title').textContent    = top;
+    const t2El = el('card-preview-title2');
+    if (t2El) { t2El.style.display = 'none'; }
     el('card-preview-subtitle').textContent = bottom;
     el('card-preview-btns').style.display   = 'flex';
     toggleBtn.style.display = '';
@@ -1597,6 +1639,8 @@ function updateCardPreview() {
   } else if (card.type === 'end') {
     el('card-preview-label').textContent    = 'END CARD';
     el('card-preview-title').textContent    = state.endCardTitle    || 'The End';
+    const t2El2 = el('card-preview-title2');
+    if (t2El2) { t2El2.style.display = 'none'; }
     el('card-preview-subtitle').textContent = state.endCardSubtitle || '';
     el('card-preview-btns').style.display   = 'flex';
     toggleBtn.style.display = 'none';
@@ -1752,17 +1796,50 @@ async function skipClip() {
   }
 }
 
+function autoTakeClip() {
+  if (_playAllMode) return;
+  const clip = state.clips[state.current];
+  if (!clip) return;
+  const sel = state.selections[clip.filename];
+  if (!sel || !sel.enabled) {
+    // clip is not taken — enable it and save current marks
+    const primary = state.markSlots[0] ?? 0;
+    const extras  = state.markSlots.slice(1).map(t => t ?? 0);
+    saveSelection(clip.filename, primary, true, extras);
+  }
+}
+
 async function saveSelection(filename, startTime, enabled, extraStarts = []) {
-  state.selections[filename] = { filename, start_time: startTime, enabled, extra_starts: extraStarts };
+  const cur = state.selections[filename] || {};
+  const locationName = cur.location_name || '';
+  state.selections[filename] = { filename, start_time: startTime, enabled, extra_starts: extraStarts, location_name: locationName };
   updateQueueItem(filename);
   updateStats();
   updateDecisionBadge();
 
   try {
-    await api('POST', '/api/select', { filename, start_time: startTime, enabled, extra_starts: extraStarts });
+    await api('POST', '/api/select', { filename, start_time: startTime, enabled, extra_starts: extraStarts, location_name: locationName });
   } catch (e) {
     console.warn('saveSelection error:', e);
   }
+}
+
+function updateLocationInput() {
+  const clip = state.clips[state.current];
+  if (!clip) return;
+  const sel = state.selections[clip.filename];
+  const loc = sel ? (sel.location_name || '') : '';
+  el('location-input').value = loc;
+}
+
+function onLocationChange(value) {
+  const clip = state.clips[state.current];
+  if (!clip) return;
+  const sel = state.selections[clip.filename] || {};
+  sel.location_name = value.trim();
+  state.selections[clip.filename] = sel;
+  updateQueueItem(clip.filename);
+  api('POST', '/api/select', { filename: clip.filename, start_time: sel.start_time ?? null, enabled: sel.enabled !== false, extra_starts: sel.extra_starts || [], location_name: value.trim() }).catch(() => {});
 }
 
 function updateDecisionBadge() {
@@ -2001,6 +2078,11 @@ function updateQueueItem(filename) {
   } else {
     div.classList.add('skipped');
     icon.textContent = '✗';
+  }
+  if (sel && sel.location_name) {
+    div.classList.add('has-location');
+  } else {
+    div.classList.remove('has-location');
   }
   if (idx === state.current) div.classList.add('current');
 }
@@ -2698,7 +2780,8 @@ async function selectAll() {
     const sel   = state.selections[clip.filename];
     const start = (sel && sel.start_time != null) ? sel.start_time : 0;
     const extra = (sel && sel.extra_starts) || [];
-    state.selections[clip.filename] = { filename: clip.filename, start_time: start, enabled: true, extra_starts: extra };
+    const loc   = (sel && sel.location_name) || '';
+    state.selections[clip.filename] = { filename: clip.filename, start_time: start, enabled: true, extra_starts: extra, location_name: loc };
     updateQueueItem(clip.filename);
     promises.push(api('POST', '/api/select', state.selections[clip.filename]));
   }
@@ -2724,7 +2807,9 @@ async function clearCache() {
 async function clearAll() {
   const promises = [];
   for (const clip of state.clips) {
-    state.selections[clip.filename] = { filename: clip.filename, start_time: null, enabled: false, extra_starts: [] };
+    const sel = state.selections[clip.filename];
+    const loc = (sel && sel.location_name) || '';
+    state.selections[clip.filename] = { filename: clip.filename, start_time: null, enabled: false, extra_starts: [], location_name: loc };
     updateQueueItem(clip.filename);
     promises.push(api('POST', '/api/select', state.selections[clip.filename]));
   }
