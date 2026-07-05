@@ -39,6 +39,8 @@ FFPROBE = _find_tool('ffprobe')
 
 # ─── Global state ────────────────────────────────────────────────────────────
 
+EMBED_THUMBNAIL = False  # set via --thumbnail flag
+
 state_lock = threading.Lock()
 state = {
     'folder': None,
@@ -150,8 +152,11 @@ def run_cmd(cmd, timeout=60, cwd=None):
         kwargs['cwd'] = cwd
     if IS_WIN:
         kwargs['creationflags'] = _NO_WINDOW
-    r = subprocess.run(cmd, **kwargs)
-    return r.returncode, r.stdout, r.stderr
+    try:
+        r = subprocess.run(cmd, **kwargs)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        raise  # let caller decide how to handle
 
 
 def ffprobe_info(path):
@@ -266,6 +271,148 @@ def scan_music(folder):
         dur, _, _, _, _ = ffprobe_info(path)
         tracks.append({'filename': name, 'duration': round(dur, 3)})
         print(f'  Music: {name} ({dur:.1f}s)')
+    return tracks
+
+
+# ─── Scan cache (avoid ffprobe on every startup) ────────────────────────────
+
+def _scan_cache_path(folder):
+    return os.path.join(folder, '.clip_cache', 'scan_cache.json')
+
+def _load_scan_cache(folder):
+    try:
+        with open(_scan_cache_path(folder), 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_scan_cache(folder, cache):
+    path = _scan_cache_path(folder)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(cache, f, indent=2, sort_keys=True)
+
+def scan_folder(folder):
+    """Return sorted list of clip dicts. Uses cached ffprobe results."""
+    cache = _load_scan_cache(folder)
+    clips_cache = cache.get('clips', {})
+
+    # List current files
+    current = {}
+    try:
+        for name in os.listdir(folder):
+            if name.lower().endswith('.mp4'):
+                p = os.path.join(folder, name)
+                s = os.stat(p)
+                current[name] = s
+    except Exception as e:
+        print(f'Scan error: {e}')
+        return []
+
+    # Separate cache hits and misses
+    entries = []
+    need_ffprobe = []
+    for name, s in current.items():
+        cached = clips_cache.get(name)
+        if cached and cached['mtime'] == s.st_mtime and cached['size'] == s.st_size:
+            entries.append((s.st_mtime, name.lower(), name, cached))
+        else:
+            need_ffprobe.append((s.st_mtime, name.lower(), name))
+
+    n_total = len(current)
+    n_hits  = len(entries)
+    if n_hits:
+        print(f'  Scan cache: {n_hits}/{n_total} clips unchanged')
+
+    # ffprobe only missing/changed files
+    for mtime, name_lower, name in need_ffprobe:
+        path = os.path.join(folder, name)
+        print(f'  [{n_hits + need_ffprobe.index((mtime, name_lower, name)) + 1}/{n_total}] {name} ...', end='', flush=True)
+        dur, codec, w, h, color_transfer = ffprobe_info(path)
+        hdr = is_hdr_transfer(color_transfer)
+        tag = f' [{codec}{"  HDR" if hdr else ""}]' if codec else ''
+        print(f' {dur:.1f}s{tag}')
+        info = {
+            'mtime': mtime,
+            'size': current[name].st_size,
+            'duration': round(dur, 3),
+            'codec': codec or '',
+            'width': w,
+            'height': h,
+            'is_hdr': hdr,
+        }
+        clips_cache[name] = info
+        entries.append((mtime, name_lower, name, info))
+
+    # Remove stale cache entries
+    for name in list(clips_cache.keys()):
+        if name not in current:
+            del clips_cache[name]
+
+    _save_scan_cache(folder, {'clips': clips_cache, 'music': cache.get('music', {})})
+
+    # Sort chronological, then alpha
+    entries.sort(key=lambda x: (x[0], x[1]))
+
+    clips = []
+    for i, (mtime, _, name, info) in enumerate(entries):
+        dt = datetime.datetime.fromtimestamp(mtime)
+        clips.append({
+            'id': i,
+            'filename': name,
+            'duration': info['duration'],
+            'codec': info.get('codec', ''),
+            'modified': dt.isoformat(),
+            'width':  info.get('width', 0),
+            'height': info.get('height', 0),
+            'is_hdr': info.get('is_hdr', False),
+        })
+    return clips
+
+
+MUSIC_EXTS = {'.mp3', '.flac', '.wav', '.aac', '.ogg', '.m4a'}
+
+def scan_music(folder):
+    """Return list of music track dicts from folder/music/, sorted alphabetically.
+    Uses cached ffprobe results."""
+    cache = _load_scan_cache(folder)
+    music_cache = cache.get('music', {})
+    clips_cache = cache.get('clips', {})
+
+    music_dir = os.path.join(folder, 'music')
+    if not os.path.isdir(music_dir):
+        return []
+    try:
+        names = sorted(n for n in os.listdir(music_dir) if os.path.splitext(n.lower())[1] in MUSIC_EXTS)
+    except Exception as e:
+        print(f'Music scan error: {e}')
+        return []
+
+    tracks = []
+    need_ffprobe = []
+    for name in names:
+        path = os.path.join(music_dir, name)
+        s = os.stat(path)
+        cached = music_cache.get(name)
+        if cached and cached['mtime'] == s.st_mtime and cached['size'] == s.st_size:
+            print(f'  Music: {name} ({cached["duration"]:.1f}s) [cache]')
+            tracks.append({'filename': name, 'duration': cached['duration']})
+        else:
+            need_ffprobe.append((name, s))
+
+    for name, s in need_ffprobe:
+        path = os.path.join(music_dir, name)
+        dur, _, _, _, _ = ffprobe_info(path)
+        print(f'  Music: {name} ({dur:.1f}s)')
+        music_cache[name] = {'mtime': s.st_mtime, 'size': s.st_size, 'duration': round(dur, 3)}
+        tracks.append({'filename': name, 'duration': round(dur, 3)})
+
+    # Remove stale music cache entries
+    for name in list(music_cache.keys()):
+        if name not in names:
+            del music_cache[name]
+
+    _save_scan_cache(folder, {'clips': clips_cache, 'music': music_cache})
     return tracks
 
 
@@ -472,7 +619,14 @@ def esc_drawtext(s):
              .replace('%', '%%')
              .replace(',', '\\,')
              .replace('>', '\\>')
-             .replace('<', '\\<'))
+             .replace('<', '\\<')
+             .replace('(', '\\(')
+             .replace(')', '\\)'))
+
+def _sq(s):
+    """Escape text for a single-quoted drawtext option value ('...').
+    Only ' needs escaping (via '\\'' pattern); % needs doubling for drawtext."""
+    return s.replace("'", "'\\''").replace('%', '%%')
 
 
 def _esc_font(path):
@@ -531,30 +685,29 @@ def generate_title_card(title, subtitle, out_path, title2=''):
     # Segoe UI Symbol / MDL2 have ⏵ (U+23F5); everything else uses ▶ (U+25B6)
     icon_char  = '\u23f5' if ('seguisym' in name_lower or 'segmdl2' in name_lower) else '\u25b6'
 
-    title_esc  = esc_drawtext(title)
     has_title2 = bool(title2.strip())
 
     # Two title lines: shift block up so it stays centred vertically in the frame
     title_y    = 970  if has_title2 else 1020
     subtitle_y = 1190 if has_title2 else 1140
 
+    # All drawtext text= values are single-quoted — inside '...' only '
+    # is special (escaped via '\''); parens, colons etc. are literal.
     # \, inside enable= escapes the comma so it's not treated as a filter separator
     vf_parts = [
-        f"drawtext=fontfile={icon_name}:text={icon_char}:fontsize=320:"
+        f"drawtext=fontfile={icon_name}:text='{icon_char}':fontsize=320:"
         f"fontcolor=white:x=(w-tw)/2:y=580:enable=lt(t\\,1)",
-        f"drawtext=fontfile={text_name}:text={title_esc}:fontsize=90:"
+        f"drawtext=fontfile={text_name}:text='{_sq(title)}':fontsize=90:"
         f"fontcolor=white:x=(w-tw)/2:y={title_y}:enable=lt(t\\,3)",
     ]
     if has_title2:
-        title2_esc = esc_drawtext(title2.strip())
         vf_parts.append(
-            f"drawtext=fontfile={text_name}:text={title2_esc}:fontsize=90:"
+            f"drawtext=fontfile={text_name}:text='{_sq(title2.strip())}':fontsize=90:"
             f"fontcolor=white:x=(w-tw)/2:y={title_y + 105}:enable=lt(t\\,3)"
         )
     if subtitle.strip():
-        sub_esc = esc_drawtext(subtitle.strip())
         vf_parts.append(
-            f"drawtext=fontfile={text_name}:text={sub_esc}:fontsize=60:"
+            f"drawtext=fontfile={text_name}:text='{_sq(subtitle.strip())}':fontsize=60:"
             f"fontcolor=white:x=(w-tw)/2:y={subtitle_y}:enable=lt(t\\,3)"
         )
 
@@ -591,18 +744,16 @@ def generate_end_card(out_path, title='', subtitle=''):
     font_dir  = os.path.dirname(font)
     font_name = os.path.basename(font)
     main_text = title or 'The End'
-    main_esc  = esc_drawtext(main_text)
     if subtitle:
-        sub_esc   = esc_drawtext(subtitle)
         vf_parts = [
-            f"drawtext=fontfile={font_name}:text={main_esc}:fontsize=120:"
+            f"drawtext=fontfile={font_name}:text='{_sq(main_text)}':fontsize=120:"
             f"fontcolor=white:x=(w-tw)/2:y=(h-th)/2-50",
-            f"drawtext=fontfile={font_name}:text={sub_esc}:fontsize=60:"
+            f"drawtext=fontfile={font_name}:text='{_sq(subtitle)}':fontsize=60:"
             f"fontcolor=#aaaaaa:x=(w-tw)/2:y=(h-th)/2+70",
         ]
     else:
         vf_parts = [
-            f"drawtext=fontfile={font_name}:text={main_esc}:fontsize=120:"
+            f"drawtext=fontfile={font_name}:text='{_sq(main_text)}':fontsize=120:"
             f"fontcolor=white:x=(w-tw)/2:y=(h-th)/2",
         ]
     cmd = [
@@ -647,15 +798,13 @@ def generate_day_card(date_str, day_name, out_path, title_override='', subtitle_
     # Sub text: custom subtitle overrides the day name
     sub_text = subtitle_override if subtitle_override else day_name
 
-    main_esc = esc_drawtext(main_text)
     vf_parts = [
-        f"drawtext=fontfile={font_name}:text={main_esc}:fontsize=96:"
+        f"drawtext=fontfile={font_name}:text='{_sq(main_text)}':fontsize=96:"
         f"fontcolor=white:x=(w-tw)/2:y=(h-th)/2-50",
     ]
     if sub_text:
-        sub_esc = esc_drawtext(sub_text)
         vf_parts.append(
-            f"drawtext=fontfile={font_name}:text={sub_esc}:fontsize=60:"
+            f"drawtext=fontfile={font_name}:text='{_sq(sub_text)}':fontsize=60:"
             f"fontcolor=#aaaaaa:x=(w-tw)/2:y=(h-th)/2+70"
         )
 
@@ -747,7 +896,11 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
 
     names = ', '.join(t['filename'] for t in music_tracks)
     print(f'  Mixing music ({n} track(s)): {names}  |  fade @{fade_start:.1f}s', flush=True)
-    rc, _, err = run_cmd(cmd, timeout=600)
+    try:
+        rc, _, err = run_cmd(cmd, timeout=1800)
+    except Exception as e:
+        print(f'WARN: Music mixing timed out or failed: {e}')
+        return None
     if rc != 0:
         print('WARN: Music mixing error:', err.decode('utf-8', errors='replace')[-400:])
         return None
@@ -890,9 +1043,7 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
                   'crop=1080:1920')
             if location_name and location_font:
                 font_esc = _esc_font(location_font)
-                # single-quoted text: only ' needs escaping ('\'' pattern);
-                # Windows argv doesn't treat ' as special inside outer "..."
-                loc_esc  = location_name.replace("'", "'\\''").replace('%', '%%')
+                loc_esc  = _sq(location_name)
                 vf += (f',drawtext=fontfile=\'{font_esc}\':text=\'{loc_esc}\':'
                        f'x=30:y=h-th-30:fontcolor=white:fontsize=144:'
                        f'alpha=0.85:'
@@ -978,124 +1129,134 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
     if end_file:
         concat_list.append(end_file)
 
-    # Write filelist.txt (FFmpeg concat demuxer)
-    flist = os.path.join(temp_dir, 'filelist.txt')
-    try:
-        with open(flist, 'w', encoding='utf-8') as f:
-            for p in concat_list:
-                p_unix = os.path.abspath(p).replace('\\', '/')
-                f.write(f"file '{p_unix}'\n")
-    except Exception as e:
-        set_status('error', f'Filelist error: {e}', 0)
-        return
-
     has_music   = bool(music_tracks)
     out_path    = os.path.join(out_dir, out_name)
-    concat_path = os.path.join(temp_dir, 'concat_out.mp4') if has_music else out_path
 
-    # Estimate total duration so we can track merge progress
-    day_file_set = {v for v in day_files.values() if v}
-    total_merge_dur = sum(
-        4.0 if f == title_file else
-        5.0 if f == end_file    else
-        2.0 if f in day_file_set else
-        clip_duration
-        for f in concat_list
-    )
+    # Concat cache: hash of all input paths (each already content-addressed)
+    concat_key = '|'.join(os.path.abspath(p).replace('\\', '/') for p in concat_list)
+    concat_h   = hashlib.md5(concat_key.encode()).hexdigest()[:16]
+    concat_dir = os.path.join(folder, '.clip_cache')
+    concat_cache = os.path.join(concat_dir, f'concat_{concat_h}.mp4')
 
-    set_status('working', f'Merging {len(concat_list)} segments...', 86)
-    merge_cmd = [FFMPEG, '-y', '-f', 'concat', '-safe', '0', '-i', flist,
-                 '-c', 'copy', '-progress', 'pipe:1', '-nostats', concat_path]
-    merge_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if IS_WIN:
-        merge_kw['creationflags'] = _NO_WINDOW
+    concat_path = concat_cache  # always merge/write to cache
 
-    proc = subprocess.Popen(merge_cmd, **merge_kw)
-    with export_lock:
-        export_proc = proc
-
-    # Drain stderr in background to prevent pipe deadlock
-    stderr_buf = []
-    def _drain():
+    if not os.path.isfile(concat_cache):
+        # Write filelist (needed for merge)
+        flist = os.path.join(temp_dir, 'filelist.txt')
         try:
-            for chunk in iter(lambda: proc.stderr.read(4096), b''):
-                stderr_buf.append(chunk)
+            with open(flist, 'w', encoding='utf-8') as f:
+                for p in concat_list:
+                    p_unix = os.path.abspath(p).replace('\\', '/')
+                    f.write(f"file '{p_unix}'\n")
+        except Exception as e:
+            set_status('error', f'Filelist error: {e}', 0)
+            return
+
+        day_file_set = {v for v in day_files.values() if v}
+        total_merge_dur = sum(
+            4.0 if f == title_file else
+            5.0 if f == end_file    else
+            2.0 if f in day_file_set else
+            clip_duration
+            for f in concat_list
+        )
+
+        set_status('working', f'Merging {len(concat_list)} segments...', 86)
+        merge_cmd = [FFMPEG, '-y', '-f', 'concat', '-safe', '0', '-i', flist,
+                     '-c', 'copy', '-progress', 'pipe:1', '-nostats', concat_path]
+        merge_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if IS_WIN:
+            merge_kw['creationflags'] = _NO_WINDOW
+
+        proc = subprocess.Popen(merge_cmd, **merge_kw)
+        with export_lock:
+            export_proc = proc
+
+        stderr_buf = []
+        def _drain():
+            try:
+                for chunk in iter(lambda: proc.stderr.read(4096), b''):
+                    stderr_buf.append(chunk)
+            except Exception:
+                pass
+        t_err = threading.Thread(target=_drain, daemon=True)
+        t_err.start()
+
+        try:
+            for raw in proc.stdout:
+                if cancelled():
+                    proc.kill()
+                    proc.wait()
+                    set_status('error', 'Cancelled', 0)
+                    return
+                line = raw.decode('utf-8', errors='replace').strip()
+                if line.startswith('out_time_ms='):
+                    try:
+                        us = int(line.split('=', 1)[1])
+                        if total_merge_dur > 0 and us > 0:
+                            frac = min(us / 1_000_000 / total_merge_dur, 1.0)
+                            pct  = int(86 + frac * 6)
+                            set_status('working',
+                                       f'Merging {len(concat_list)} segments... {int(frac * 100)}%',
+                                       pct)
+                    except (ValueError, IndexError):
+                        pass
+        except Exception as e:
+            proc.kill()
+            proc.wait()
+            set_status('error', f'Merging error: {e}', 0)
+            return
+        finally:
+            proc.stdout.close()
+            t_err.join(timeout=5)
+            with export_lock:
+                export_proc = None
+
+        rc = proc.wait(timeout=3600)
+        err = b''.join(stderr_buf)
+        if rc != 0:
+            msg = err.decode('utf-8', errors='replace')[-400:]
+            set_status('error', f'Merging error: {msg}', 0)
+            return
+    else:
+        print(f'  [cache] concat: {len(concat_list)} segments')
+
+    if not has_music:
+        import shutil
+        if concat_cache != out_path:
+            shutil.copy2(concat_cache, out_path)
+        return
+
+    set_status('working', 'Adding music...', 92)
+    result = _add_music_to_video(folder, concat_cache, out_path, music_tracks)
+    if result:
+        try:
+            os.remove(concat_cache)
         except Exception:
             pass
-    t_err = threading.Thread(target=_drain, daemon=True)
-    t_err.start()
-
-    try:
-        for raw in proc.stdout:
-            if cancelled():
-                proc.kill()
-                proc.wait()
-                set_status('error', 'Cancelled', 0)
-                return
-            line = raw.decode('utf-8', errors='replace').strip()
-            if line.startswith('out_time_ms='):
-                try:
-                    us = int(line.split('=', 1)[1])
-                    if total_merge_dur > 0 and us > 0:
-                        frac = min(us / 1_000_000 / total_merge_dur, 1.0)
-                        pct  = int(86 + frac * 6)   # 86 → 92
-                        set_status('working',
-                                   f'Merging {len(concat_list)} segments... {int(frac * 100)}%',
-                                   pct)
-                except (ValueError, IndexError):
-                    pass
-    except Exception as e:
-        proc.kill()
-        proc.wait()
-        set_status('error', f'Merging error: {e}', 0)
-        return
-    finally:
-        proc.stdout.close()
-        t_err.join(timeout=5)
-        with export_lock:
-            export_proc = None
-
-    rc = proc.wait(timeout=3600)
-    err = b''.join(stderr_buf)
-    if rc != 0:
-        msg = err.decode('utf-8', errors='replace')[-400:]
-        set_status('error', f'Merging error: {msg}', 0)
-        return
-
-    if has_music:
-        set_status('working', 'Adding music...', 92)
-        result = _add_music_to_video(folder, concat_path, out_path, music_tracks)
-        if result:
-            try:
-                os.remove(concat_path)
-            except Exception:
-                pass
-        else:
-            # Fallback: use concat result without music
-            try:
-                os.replace(concat_path, out_path)
-            except Exception:
-                pass
-            print('WARN: Music was not added – film saved without music')
+    else:
+        # Fallback: use concat result without music
+        try:
+            os.replace(concat_cache, out_path)
+        except Exception:
+            pass
+        print('WARN: Music was not added – film saved without music')
 
     # Embed title card thumbnail as cover art so Windows Explorer shows it
-    if title_file:
+    if EMBED_THUMBNAIL and title_file:
         thumb_path = title_file.replace('.mp4', '_thumb.jpg')
         if not os.path.isfile(thumb_path):
-            # Title card was served from cache but _thumb.jpg is missing — generate it now
             run_cmd([FFMPEG, '-y', '-ss', '0', '-i', title_file,
                      '-vframes', '1', '-q:v', '3', thumb_path], timeout=15)
         if os.path.isfile(thumb_path):
             set_status('working', 'Embedding thumbnail...', 94)
             ok = _embed_mp4_thumbnail(out_path, thumb_path)
             if ok and IS_WIN:
-                # Tell Windows Explorer to discard its cached thumbnail and re-read the file
                 try:
                     import ctypes
                     abs_out = os.path.abspath(out_path)
                     ctypes.windll.shell32.SHChangeNotify(
-                        0x00002000,          # SHCNE_UPDATEITEM
-                        0x0005,              # SHCNF_PATHW
+                        0x00002000, 0x0005,
                         ctypes.c_wchar_p(abs_out), None)
                 except Exception:
                     pass
@@ -1869,11 +2030,19 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def main():
+    global EMBED_THUMBNAIL
+
     check_ffmpeg()
     print('FFmpeg: OK')
 
-    if len(sys.argv) > 1:
-        folder = os.path.abspath(sys.argv[1])
+    # Filter flags from positional args
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if '--thumbnail' in sys.argv:
+        EMBED_THUMBNAIL = True
+        print('Thumbnail embedding: ON')
+
+    if args:
+        folder = os.path.abspath(args[0])
         if not os.path.isdir(folder):
             print(f'ERROR: Folder does not exist: {folder}')
             sys.exit(1)

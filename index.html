@@ -184,6 +184,16 @@
     }
     #video-wait.show { display: flex; }
 
+    /* Crop area overlay */
+    #crop-overlay {
+      position: absolute;
+      pointer-events: none;
+      border: 2px solid var(--orange);
+      border-radius: 2px;
+      z-index: 5;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,.35);
+    }
+
     /* Status badge on video */
     #clip-badge {
       position: absolute;
@@ -972,6 +982,7 @@
       </div>
       <div id="video-wrap">
         <video id="video" preload="metadata"></video>
+        <div id="crop-overlay" style="display:none"></div>
         <div id="clip-badge"></div>
         <div id="video-wait">
           <div class="spinner"></div>
@@ -1276,6 +1287,10 @@ async function loadFolder() {
     await loadClipsFromServer();
     el('overlay-scanning').classList.add('hidden');
     showApp();
+    window.addEventListener('resize', () => {
+      const clip = state.clips[state.current];
+      if (clip) updateCropOverlay(clip);
+    });
   } catch (e) {
     el('overlay-scanning').classList.add('hidden');
     el('overlay-loader').classList.remove('hidden');
@@ -1547,6 +1562,7 @@ function goToClip(idx) {
   el('video-wrap').style.aspectRatio = clipLandscape ? '16 / 9' : '9 / 16';
 
   checkClipSize(clip);
+  updateCropOverlay(clip);
 
   // Restore slots from previous decision
   const sel = state.selections[clip.filename];
@@ -3156,6 +3172,44 @@ function checkClipSize(clip) {
     msg.textContent = issue;
     warn.classList.add('show');
   }
+}
+
+// ── Crop overlay ──────────────────────────────────────────────────────────────
+function updateCropOverlay(clip) {
+  const el = document.getElementById('crop-overlay');
+  if (!el) return;
+  const w = clip.width || 0, h = clip.height || 0;
+  if (!w || !h) { el.style.display = 'none'; return; }
+  // Already 9:16 — no crop needed
+  if (w === 1080 && h === 1920) { el.style.display = 'none'; return; }
+  if (w > h) { el.style.display = 'none'; return; }  // landscape — skip
+
+  const wrap = document.getElementById('video-wrap');
+  const wrapW = wrap.offsetWidth, wrapH = wrap.offsetHeight;
+  const fit = Math.min(wrapW / w, wrapH / h);
+  const dispW = w * fit, dispH = h * fit;
+  const dispX = (wrapW - dispW) / 2, dispY = (wrapH - dispH) / 2;
+
+  // scale=1080:1920:increase → s = max(1080/w, 1920/h)
+  const s = Math.max(1080 / w, 1920 / h);
+  const cropX = Math.max(0, (w * s - 1080) / (2 * s));
+  const cropY = Math.max(0, (h * s - 1920) / (2 * s));
+  const cropW = Math.min(w, 1080 / s);
+  const cropH = Math.min(h, 1920 / s);
+
+  // Only show if actually cropped (not covering full frame)
+  if (cropX < 0.5 && cropY < 0.5 && cropW >= w - 0.5 && cropH >= h - 0.5) {
+    el.style.display = 'none';
+    return;
+  }
+
+  el.style.cssText = [
+    `left:${dispX + cropX * fit}px`,
+    `top:${dispY + cropY * fit}px`,
+    `width:${cropW * fit}px`,
+    `height:${cropH * fit}px`,
+    'display:',
+  ].join(';');
 }
 
 // ── Shutdown ──────────────────────────────────────────────────────────────────
