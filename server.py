@@ -850,18 +850,24 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
     for p in music_paths:
         inputs += ['-i', p]
 
-    # Build filter_complex: trim each track to track_end, add offset silence, concat, mix with video
-    # track_offset = silence (ms) before the track in the film timeline
+    # Build filter_complex: trim each track to track_end, add 3s fade-out, silence offset, concat, mix with video
     parts = []
     processed = []
+    fade_dur = 3.0
     for i, t in enumerate(music_tracks):
         src    = f'[{i+1}:a]'
         label  = f'[mus_t{i}]'
         te     = t.get('track_end')
         offset = t.get('track_offset') or 0
         filters = []
+        # Trim to track_end
         if te is not None and te < t['duration']:
             filters.append(f'atrim=0:{te:.3f},asetpts=PTS-STARTPTS')
+        # Fade out at end of the track segment (3s before trim end or track duration)
+        track_end_actual = te if te is not None and te < t['duration'] else t['duration']
+        f_start = max(0.0, track_end_actual - fade_dur)
+        filters.append(f'afade=t=out:st={f_start:.3f}:d={fade_dur:.3f}')
+        # Silence offset before the track in the film timeline
         if offset > 0:
             delay_ms = int(round(offset * 1000))
             filters.append(f'adelay={delay_ms}|{delay_ms}')
@@ -921,7 +927,11 @@ def _embed_mp4_thumbnail(video_path, thumb_path):
         '-disposition:v:1', 'attached_pic',
         temp,
     ]
-    rc, _, err = run_cmd(cmd, timeout=600)
+    try:
+        rc, _, err = run_cmd(cmd, timeout=1800)
+    except Exception as e:
+        print(f'WARN: Thumbnail embed timed out: {e}')
+        return False
     if rc == 0:
         try:
             os.replace(temp, video_path)
@@ -1045,7 +1055,7 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
                 font_esc = _esc_font(location_font)
                 loc_esc  = _sq(location_name)
                 vf += (f',drawtext=fontfile=\'{font_esc}\':text=\'{loc_esc}\':'
-                       f'x=30:y=h-th-30:fontcolor=white:fontsize=144:'
+                       f'x=30:y=h-th-30:fontcolor=white:fontsize=72:'
                        f'alpha=0.85:'
                        f'shadowcolor=black@0.6:shadowx=2:shadowy=2')
             fade_start = max(0.0, clip_duration - 0.3)
@@ -2064,9 +2074,12 @@ def main():
         clips = apply_clip_order(clips, clip_order)
         music = scan_music(folder)
         # Apply saved track_end and track_offset values to music tracks
+        print(f'DEBUG: music_ends={json.dumps(music_ends)}')
         for t in music:
             if t['filename'] in music_ends:
-                t['track_end'] = float(music_ends[t['filename']])
+                val = float(music_ends[t['filename']])
+                print(f'DEBUG: track_end {t["filename"]} → {val}')
+                t['track_end'] = val
             if t['filename'] in music_offsets:
                 t['track_offset'] = float(music_offsets[t['filename']])
         with state_lock:
