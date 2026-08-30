@@ -1977,39 +1977,31 @@ function daysWithEnabledClips() {
   return days;
 }
 
-function isCrossDayInversion(leftClip, rightClip) {
-  return leftClip.modified > rightClip.modified && clipDay(leftClip) !== clipDay(rightClip);
-}
-
 function buildQueueItems() {
   const showDayCards  = el('day-cards-cb') ? el('day-cards-cb').checked : true;
   const showSkipped   = el('show-skipped-cb') ? el('show-skipped-cb').checked : true;
-  const enabledDays   = daysWithEnabledClips();
   const items = [{ type: 'intro' }];
-  let lastDay    = null;
-  let isFirstDay = true;
+  let lastEnabledDay    = null;
+  let isFirstEnabledDay = true;
   state.clips.forEach((clip, i) => {
     const day = clipDay(clip);
     const sel = state.selections[clip.filename];
     const isSkipped = sel && !sel.enabled;
-    // Suppress cards around an out-of-order jump only when it crosses a day boundary.
-    // Reordering clips within one day must leave that day's card in place.
-    const prevHasDot = i > 0 && isCrossDayInversion(state.clips[i - 1], clip);
-    const thisHasDot = i < state.clips.length - 1 && isCrossDayInversion(clip, state.clips[i + 1]);
-    const suppressDayCard = prevHasDot || thisHasDot;
-    if (day && day !== lastDay) {
-      const hasEnabled = enabledDays.has(day);
-      if (showDayCards && hasEnabled && (!isFirstDay || !state.projectTitle) && !suppressDayCard) {
+    const isEnabled = !!sel?.enabled;
+    // Day cards follow enabled clips exactly as they do in export. Hidden, skipped,
+    // and undecided clips must not move the film timeline.
+    if (isEnabled && day && day !== lastEnabledDay) {
+      if (showDayCards && (!isFirstEnabledDay || !state.projectTitle)) {
         const disabled    = state.disabledDayCards.has(day);
         const customTitle = state.dayCardTitles[day] || null;
         if (showSkipped || !disabled) {
           items.push({ type: 'day', date: day, dayDisabled: disabled, customTitle });
         }
       }
-      lastDay = day;
-      isFirstDay = false;
+      lastEnabledDay = day;
+      isFirstEnabledDay = false;
     }
-    items.push({ type: 'clip', clip, clipIdx: i });
+    if (showSkipped || !isSkipped) items.push({ type: 'clip', clip, clipIdx: i });
   });
   items.push({ type: 'end' });
   return items;
@@ -2577,7 +2569,6 @@ function updateMusicBlockTitle(div, track, absStart, absEnd) {
 function buildStripLayout() {
   const showSkipped  = !!(el('show-skipped-cb')?.checked);
   const showDayCards = !!(el('day-cards-cb')?.checked);
-  const enabledDays  = daysWithEnabledClips();
   const GAP = 4;
   const segs = [];
   let filmSec = 0, stripPx = 0;
@@ -2591,19 +2582,16 @@ function buildStripLayout() {
 
   if (state.projectTitle) push(4, 48, false);
 
-  let lastDay = null, isFirstDay = true;
+  let lastEnabledDay = null, isFirstEnabledDay = true;
   state.clips.forEach((clip, i) => {
     const day = clipDay(clip);
     const sel = state.selections[clip.filename];
-    if (day && day !== lastDay) {
-      const hasEnabled = enabledDays.has(day);
-      const prevDot = i > 0 && isCrossDayInversion(state.clips[i - 1], clip);
-      const nextDot = i < state.clips.length - 1 && isCrossDayInversion(clip, state.clips[i + 1]);
-      if (showDayCards && hasEnabled && (!isFirstDay || !state.projectTitle) && !prevDot && !nextDot) {
+    if (sel?.enabled && day && day !== lastEnabledDay) {
+      if (showDayCards && (!isFirstEnabledDay || !state.projectTitle)) {
         const dd = state.disabledDayCards.has(day);
         if (showSkipped || !dd) push(dd ? 0 : 2, 24, dd);
       }
-      lastDay = day; isFirstDay = false;
+      lastEnabledDay = day; isFirstEnabledDay = false;
     }
     if (sel?.enabled) {
       const n = 1 + (sel.extra_starts || []).length;

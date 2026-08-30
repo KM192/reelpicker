@@ -55,9 +55,49 @@ class MusicTrimTests(unittest.TestCase):
         command = run_cmd.call_args.args[0]
         filter_graph = command[command.index('-filter_complex') + 1]
         self.assertIn('atrim=2.000000:8.000000,asetpts=PTS-STARTPTS', filter_graph)
+        self.assertIn('afade=t=in:st=0:d=3.000000', filter_graph)
         self.assertIn('afade=t=out:st=3.000000:d=3.000000', filter_graph)
-        self.assertIn('adelay=1000|1000', filter_graph)
+        self.assertIn('adelay=delays=44100S:all=1', filter_graph)
         self.assertIn('afade=t=out:st=10.000:d=10.000[mus]', filter_graph)
+        self.assertEqual(filter_graph.count('asetpts=PTS-STARTPTS'), 1)
+
+    @mock.patch.object(server, 'run_cmd')
+    @mock.patch.object(server, 'ffprobe_info', return_value=(30.0, 1080, 1920, 'h264', False))
+    def test_multiple_tracks_use_absolute_sample_aligned_positions(self, _probe, run_cmd):
+        run_cmd.return_value = (0, b'', b'')
+        tracks = [
+            {'filename': 'one.mp3', 'duration': 10.0, 'track_end': 5.0,
+             'track_start': 2.0, 'track_offset': 1 / 30},
+            {'filename': 'two.mp3', 'duration': 10.0, 'track_end': 4.0,
+             'track_start': 1.0, 'track_offset': 2 / 30},
+        ]
+
+        server._add_music_to_video('project', 'video.mp4', 'out.mp4', tracks)
+
+        command = run_cmd.call_args.args[0]
+        filter_graph = command[command.index('-filter_complex') + 1]
+        self.assertIn('adelay=delays=1470S:all=1', filter_graph)
+        self.assertIn('adelay=delays=136710S:all=1', filter_graph)
+        self.assertIn('amix=inputs=2:duration=longest:dropout_transition=0:normalize=0', filter_graph)
+        self.assertNotIn('concat=n=2', filter_graph)
+        self.assertNotIn('[mus_raw]atrim', filter_graph)
+
+    @mock.patch.object(server, '_run_ffmpeg_progress', return_value=(0, b'', b''))
+    @mock.patch.object(server, 'ffprobe_info', return_value=(20.0, 1080, 1920, 'h264', False))
+    def test_music_mix_enables_ffmpeg_progress_reporting(self, _probe, run_progress):
+        callback = mock.Mock()
+        tracks = [{'filename': 'song.mp3', 'duration': 10.0}]
+
+        result = server._add_music_to_video(
+            'project', 'video.mp4', 'out.mp4', tracks, progress_callback=callback
+        )
+
+        self.assertEqual(result, 'out.mp4')
+        command = run_progress.call_args.args[0]
+        self.assertIn('-progress', command)
+        self.assertEqual(command[command.index('-progress') + 1], 'pipe:1')
+        self.assertIn('-nostats', command)
+        self.assertEqual(run_progress.call_args.args[1:3], (20.0, 'music mix'))
 
     def test_export_without_music_reaches_done_after_cached_merge(self):
         with tempfile.TemporaryDirectory() as folder:

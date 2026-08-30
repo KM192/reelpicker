@@ -22,6 +22,7 @@ from socketserver import ThreadingMixIn
 
 PORT = 8000
 OUTPUT_FPS = 30
+OUTPUT_AUDIO_RATE = 44100
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IS_WIN = sys.platform == 'win32'
 _NO_WINDOW = 0x08000000  # Windows: CREATE_NO_WINDOW
@@ -890,7 +891,64 @@ def generate_day_card(date_str, day_name, out_path, title_override='', subtitle_
 
 # ─── Music mixing ─────────────────────────────────────────────────────────────
 
-def _add_music_to_video(folder, video_path, out_path, music_tracks):
+def _run_ffmpeg_progress(cmd, total_duration, label, progress_callback):
+    """Run FFmpeg while streaming progress and stderr to the terminal."""
+    global export_proc
+    proc_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if IS_WIN:
+        proc_kw['creationflags'] = _NO_WINDOW
+    proc = subprocess.Popen(cmd, **proc_kw)
+    with export_lock:
+        export_proc = proc
+
+    stderr_buf = []
+    def drain_stderr():
+        try:
+            for raw_line in iter(proc.stderr.readline, b''):
+                stderr_buf.append(raw_line)
+                line = raw_line.decode('utf-8', errors='replace').rstrip()
+                if line:
+                    print(f'  [ffmpeg {label}] {line}', flush=True)
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=drain_stderr, daemon=True)
+    stderr_thread.start()
+    last_reported_pct = -5
+    try:
+        for raw in proc.stdout:
+            with export_lock:
+                should_cancel = export_cancel
+            if should_cancel:
+                proc.kill()
+                break
+            line = raw.decode('utf-8', errors='replace').strip()
+            if line.startswith('out_time_ms='):
+                try:
+                    elapsed = int(line.split('=', 1)[1]) / 1_000_000
+                    pct = min(100, int(elapsed / total_duration * 100)) if total_duration > 0 else 0
+                    progress_callback(pct)
+                    if pct >= last_reported_pct + 5 or pct == 100:
+                        print(f'  {label.capitalize()} progress: {pct}% '
+                              f'({elapsed:.1f}/{total_duration:.1f}s)', flush=True)
+                        last_reported_pct = pct
+                except (ValueError, IndexError):
+                    pass
+    finally:
+        proc.stdout.close()
+        stderr_thread.join(timeout=5)
+        with export_lock:
+            export_proc = None
+
+    rc = proc.wait(timeout=1800)
+    if rc == 0:
+        progress_callback(100)
+        if last_reported_pct < 100:
+            print(f'  {label.capitalize()} progress: 100%', flush=True)
+    return rc, b'', b''.join(stderr_buf)
+
+
+def _add_music_to_video(folder, video_path, out_path, music_tracks, progress_callback=None):
     """Mix music_tracks (from folder/music/) with video_path, write to out_path.
     Returns out_path on success, None on failure."""
     if not music_tracks:
@@ -912,10 +970,12 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
     for p in music_paths:
         inputs += ['-i', p]
 
-    # Build filter_complex: trim each track to track_end, add 3s fade-out, silence offset, concat, mix with video
+    # Place each trimmed track at an absolute, frame-aligned audio sample. This avoids
+    # accumulating millisecond rounding errors as multiple tracks are concatenated.
     parts = []
     processed = []
     track_fade_dur = 3.0
+    music_cursor = 0.0
     for i, t in enumerate(music_tracks):
         src    = f'[{i+1}:a]'
         label  = f'[mus_t{i}]'
@@ -924,31 +984,41 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
         offset = snap_to_output_frame(t.get('track_offset') or 0)
         track_end_actual = te if te is not None and te < t['duration'] else t['duration']
         ts = min(ts, max(0.0, track_end_actual - (1.0 / OUTPUT_FPS)))
-        filters = [f'atrim={ts:.6f}:{track_end_actual:.6f}', 'asetpts=PTS-STARTPTS']
-        # Fade out at end of the track segment (3s before trim end or track duration)
+        segment_start = music_cursor + offset
         segment_dur = track_end_actual - ts
+        segment_end = segment_start + segment_dur
+        delay_samples = round(segment_start * OUTPUT_AUDIO_RATE)
+        filters = [f'aresample={OUTPUT_AUDIO_RATE}',
+                   f'atrim={ts:.6f}:{track_end_actual:.6f}', 'asetpts=PTS-STARTPTS']
+        if ts > 0:
+            fade_in_dur = min(3.0, segment_dur / 2)
+            filters.append(f'afade=t=in:st=0:d={fade_in_dur:.6f}')
+        # Fade out at end of the track segment (3s before trim end or track duration)
         actual_track_fade = min(track_fade_dur, segment_dur)
         f_start = max(0.0, segment_dur - actual_track_fade)
         filters.append(f'afade=t=out:st={f_start:.6f}:d={actual_track_fade:.6f}')
-        # Silence offset before the track in the film timeline
-        if offset > 0:
-            delay_ms = int(round(offset * 1000))
-            filters.append(f'adelay={delay_ms}|{delay_ms}')
+        if delay_samples > 0:
+            filters.append(f'adelay=delays={delay_samples}S:all=1')
+        print(f'  Music timing: {t["filename"]} source {ts:.3f}-{track_end_actual:.3f}s '
+              f'-> film {segment_start:.3f}-{segment_end:.3f}s '
+              f'({delay_samples} samples)', flush=True)
         if filters:
             parts.append(f'{src}' + ','.join(filters) + f'{label}')
             processed.append(label)
         else:
             processed.append(src)
+        music_cursor = segment_end
 
     if n == 1:
         prefix = processed[0]
     else:
-        concat_ins = ''.join(processed)
-        parts.append(f'{concat_ins}concat=n={n}:v=0:a=1[mus_raw]')
+        mix_ins = ''.join(processed)
+        parts.append(f'{mix_ins}amix=inputs={n}:duration=longest:dropout_transition=0:normalize=0[mus_raw]')
         prefix = '[mus_raw]'
 
-    trim_filter = (f'{prefix}atrim=0:{video_dur:.3f},asetpts=PTS-STARTPTS,'
-                    f'afade=t=out:st={fade_start:.3f}:d={final_fade_dur:.3f}[mus]')
+    # amix below limits the output to the video stream. Trimming/resetting timestamps
+    # here would discard silence inserted by adelay and move music back to 0s.
+    trim_filter = f'{prefix}afade=t=out:st={fade_start:.3f}:d={final_fade_dur:.3f}[mus]'
     mix_filter  = '[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[audio_out]'
 
     parts.extend([trim_filter, mix_filter])
@@ -966,7 +1036,13 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
     names = ', '.join(t['filename'] for t in music_tracks)
     print(f'  Mixing music ({n} track(s)): {names}  |  fade @{fade_start:.1f}s', flush=True)
     try:
-        rc, _, err = run_cmd(cmd, timeout=1800)
+        if progress_callback:
+            progress_cmd = cmd[:-1] + ['-progress', 'pipe:1', '-nostats', cmd[-1]]
+            rc, _, err = _run_ffmpeg_progress(
+                progress_cmd, video_dur, 'music mix', progress_callback
+            )
+        else:
+            rc, _, err = run_cmd(cmd, timeout=1800)
     except Exception as e:
         print(f'WARN: Music mixing timed out or failed: {e}')
         return None
@@ -1312,7 +1388,12 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
             shutil.copy2(concat_cache, out_path)
     else:
         set_status('working', 'Adding music...', 92)
-        result = _add_music_to_video(folder, concat_cache, out_path, music_tracks)
+        result = _add_music_to_video(
+            folder, concat_cache, out_path, music_tracks,
+            progress_callback=lambda pct: set_status(
+                'working', f'Adding music... {pct}%', 92 + int(pct * 0.02)
+            ),
+        )
         if not result:
             # Keep the reusable concat cache and copy it as a music-free fallback.
             import shutil
