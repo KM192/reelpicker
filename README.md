@@ -123,7 +123,12 @@ They appear as coloured blocks in the **music bar** below the queue, scaled prop
 
 - **Drag the right handle** of a music block to trim where the track ends.
 - **Drag the left handle** (offset spacer) to delay when the track starts in the film.
-- Handles snap to clip boundaries for easy alignment.
+- **Right-click a music block**, enter the source time in `MM:SS` format and choose
+  **Set track start** to trim its beginning. Use **Reset track start** to restore it.
+- **Right-click a point on a music block** and choose **End here** to trim its end
+  without dragging the right handle.
+- Trim and offset times are aligned to the 30 fps output frame grid. Handles also snap
+  to clip boundaries for easy alignment.
 - Multiple tracks are concatenated in alphabetical order and mixed with the clip audio.
 - Music fades out over the last 10 seconds of the film (or less if the film is shorter).
 
@@ -250,6 +255,7 @@ Saved automatically after every change. Resuming work is instant — just reopen
   "end_card_subtitle": "",
   "music_ends":    {"01_song.mp3": 142.5},
   "music_offsets": {"02_song.mp3": 28.0},
+  "music_trim_starts": {"01_song.mp3": 12.0},
   "clip_order": ["clip02.mp4", "clip01.mp4", "clip03.mp4"]
 }
 ```
@@ -298,7 +304,7 @@ parameters across segments allow lossless stream copy in the concat step.
 | `POST` | `/api/day_card_toggle` | Enable / disable a day card |
 | `POST` | `/api/day_card_title` | Set custom text for a day card |
 | `POST` | `/api/end_card_title` | Set end card title + subtitle |
-| `POST` | `/api/music_ends` | Save track trim + offset values |
+| `POST` | `/api/music_ends` | Save track source trim + timeline offset values |
 | `POST` | `/api/export` | Start export |
 | `POST` | `/api/export/cancel` | Cancel running export |
 | `POST` | `/api/clear-cache` | Delete `.clip_cache/` contents |

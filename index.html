@@ -668,6 +668,48 @@
       flex-shrink: 1;
       pointer-events: none;
     }
+    #music-context-menu {
+      position: fixed;
+      z-index: 1000;
+      min-width: 190px;
+      padding: 4px;
+      background: #20202b;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    }
+    #music-context-menu.hidden { display: none; }
+    .music-context-label {
+      display: block;
+      padding: 5px 7px 3px;
+      color: var(--dim);
+      font-size: 10px;
+    }
+    #music-start-input {
+      width: calc(100% - 14px);
+      margin: 0 7px 4px;
+      padding: 6px 7px;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: var(--bg);
+      color: var(--text);
+      font: 12px monospace;
+    }
+    #music-start-input:focus { border-color: var(--accent); outline: none; }
+    #music-context-menu button {
+      width: 100%;
+      padding: 7px 9px;
+      border: 0;
+      border-radius: 3px;
+      background: transparent;
+      color: var(--text);
+      font: inherit;
+      font-size: 11px;
+      text-align: left;
+      cursor: pointer;
+    }
+    #music-context-menu button:hover { background: rgba(255,255,255,0.1); }
     #music-day-markers {
       position: relative;
       height: 16px;
@@ -1152,6 +1194,14 @@
   </div><!-- /main -->
 </div><!-- /app -->
 
+<div id="music-context-menu" class="hidden">
+  <label class="music-context-label" id="music-start-label" for="music-start-input">Track start (MM:SS)</label>
+  <input id="music-start-input" type="text" inputmode="numeric" placeholder="00:00" autocomplete="off">
+  <button type="button" id="music-set-start">Set track start</button>
+  <button type="button" id="music-set-end">End here</button>
+  <button type="button" id="music-reset-start">Reset track start</button>
+</div>
+
 <div id="kb-help">
   <strong style="color:var(--text)">Keyboard shortcuts</strong><br>
   <kbd>Space</kbd> Play / Pause<br>
@@ -1189,6 +1239,13 @@ const state = {
   musicTracks: [],          // [{filename, duration}] from folder/music/*.mp3
   clipDuration: 3.0,        // seconds each clip is cut to (configurable)
 };
+
+const OUTPUT_FPS = 30;
+const OUTPUT_FRAME_SEC = 1 / OUTPUT_FPS;
+
+function snapToOutputFrame(sec) {
+  return Math.round(Math.max(0, sec) * OUTPUT_FPS) / OUTPUT_FPS;
+}
 
 // ── Session ───────────────────────────────────────────────────────────────────
 let sessionId      = null;
@@ -1890,7 +1947,7 @@ function seekFrame(frames) {
   const v = el('video');
   if (!isFinite(v.duration)) return;
   if (!v.paused) v.pause();
-  v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + frames / 30));
+  v.currentTime = Math.max(0, Math.min(v.duration, v.currentTime + frames / OUTPUT_FPS));
 }
 
 // ── Queue ─────────────────────────────────────────────────────────────────────
@@ -1920,6 +1977,10 @@ function daysWithEnabledClips() {
   return days;
 }
 
+function isCrossDayInversion(leftClip, rightClip) {
+  return leftClip.modified > rightClip.modified && clipDay(leftClip) !== clipDay(rightClip);
+}
+
 function buildQueueItems() {
   const showDayCards  = el('day-cards-cb') ? el('day-cards-cb').checked : true;
   const showSkipped   = el('show-skipped-cb') ? el('show-skipped-cb').checked : true;
@@ -1931,11 +1992,10 @@ function buildQueueItems() {
     const day = clipDay(clip);
     const sel = state.selections[clip.filename];
     const isSkipped = sel && !sel.enabled;
-    // Suppress a day card before clip i if:
-    // - the clip itself jumps forward and will be followed by an earlier clip (has dot: clips[i].modified > clips[i+1].modified)
-    // - or the previous clip jumped forward and this clip is the "return" (prev clip has dot)
-    const prevHasDot = i > 0 && state.clips[i - 1].modified > clip.modified;
-    const thisHasDot = i < state.clips.length - 1 && clip.modified > state.clips[i + 1].modified;
+    // Suppress cards around an out-of-order jump only when it crosses a day boundary.
+    // Reordering clips within one day must leave that day's card in place.
+    const prevHasDot = i > 0 && isCrossDayInversion(state.clips[i - 1], clip);
+    const thisHasDot = i < state.clips.length - 1 && isCrossDayInversion(clip, state.clips[i + 1]);
     const suppressDayCard = prevHasDot || thisHasDot;
     if (day && day !== lastDay) {
       const hasEnabled = enabledDays.has(day);
@@ -2171,6 +2231,7 @@ function renderMusicBar() {
     div.id = `music-${i}`;
     div.style.background = `hsl(${hue}, 45%, 22%)`;
     div.style.borderColor = `hsl(${hue}, 55%, 40%)`;
+    div.addEventListener('contextmenu', e => openMusicContextMenu(e, i));
     // Left handle — drag to set timeline offset (shift block right/left)
     const handleLeft = document.createElement('div');
     handleLeft.className = 'music-drag-handle-left';
@@ -2203,6 +2264,103 @@ function renderMusicBar() {
 
   updateMusicBar();
 }
+
+let _musicContext = null;
+
+function openMusicContextMenu(event, trackIdx) {
+  event.preventDefault();
+  const track = state.musicTracks[trackIdx];
+  const rect = event.currentTarget.getBoundingClientRect();
+  const fraction = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+  const sourceStart = trackSourceStart(track);
+  const sourceSec = snapToOutputFrame(sourceStart + fraction * trackEffectiveDur(track));
+  _musicContext = { trackIdx, sourceSec };
+
+  const menu = el('music-context-menu');
+  const input = el('music-start-input');
+  el('music-start-label').textContent = `Track start (MM:SS, before ${formatMusicStartTime(trackSourceEnd(track))})`;
+  input.value = formatMusicStartTime(sourceStart);
+  input.setCustomValidity('');
+  el('music-set-end').textContent = `End here (${formatMusicStartTime(sourceSec)})`;
+  el('music-set-end').disabled = sourceSec <= sourceStart;
+  el('music-reset-start').disabled = sourceStart === 0;
+  menu.classList.remove('hidden');
+  const menuRect = menu.getBoundingClientRect();
+  menu.style.left = Math.max(4, Math.min(event.clientX, innerWidth - menuRect.width - 4)) + 'px';
+  menu.style.top = Math.max(4, Math.min(event.clientY, innerHeight - menuRect.height - 4)) + 'px';
+  requestAnimationFrame(() => { input.focus(); input.select(); });
+}
+
+function formatMusicStartTime(seconds) {
+  const wholeSeconds = Math.round(seconds);
+  const minutes = Math.floor(wholeSeconds / 60);
+  const secs = wholeSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function parseMusicStartTime(value) {
+  const match = value.trim().match(/^(\d+):([0-5]\d)$/);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function closeMusicContextMenu() {
+  el('music-context-menu')?.classList.add('hidden');
+  _musicContext = null;
+}
+
+function setMusicTrackStart(reset = false) {
+  if (!_musicContext) return;
+  const track = state.musicTracks[_musicContext.trackIdx];
+  const sourceEnd = trackSourceEnd(track);
+  const input = el('music-start-input');
+  const requested = reset ? 0 : parseMusicStartTime(input.value);
+  if (requested == null) {
+    input.setCustomValidity('Enter time as MM:SS, for example 01:35.');
+    input.reportValidity();
+    input.focus();
+    return;
+  }
+  if (!reset && requested >= sourceEnd) {
+    input.setCustomValidity(`Start must be before ${formatMusicStartTime(sourceEnd)}.`);
+    input.reportValidity();
+    input.focus();
+    return;
+  }
+  input.setCustomValidity('');
+  track.track_start = Math.min(snapToOutputFrame(requested), Math.max(0, sourceEnd - OUTPUT_FRAME_SEC));
+  if (track.track_start < OUTPUT_FRAME_SEC / 2) delete track.track_start;
+  closeMusicContextMenu();
+  updateMusicBar();
+  saveMusicEnds();
+}
+
+function setMusicTrackEndHere() {
+  if (!_musicContext) return;
+  const track = state.musicTracks[_musicContext.trackIdx];
+  track.track_end = Math.max(trackSourceStart(track) + OUTPUT_FRAME_SEC,
+                             Math.min(track.duration, _musicContext.sourceSec));
+  closeMusicContextMenu();
+  updateMusicBar();
+  saveMusicEnds();
+}
+
+document.addEventListener('click', e => {
+  if (!el('music-context-menu')?.contains(e.target)) closeMusicContextMenu();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeMusicContextMenu();
+});
+document.addEventListener('scroll', closeMusicContextMenu, true);
+el('music-set-start').addEventListener('click', () => setMusicTrackStart(false));
+el('music-set-end').addEventListener('click', setMusicTrackEndHere);
+el('music-reset-start').addEventListener('click', () => setMusicTrackStart(true));
+el('music-start-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    setMusicTrackStart(false);
+  }
+});
 
 function totalVideoDuration() {
   // Calculate total video duration including all cards at their actual durations
@@ -2319,9 +2477,17 @@ function updateMusicBar() {
 }
 
 function trackEffectiveDur(track) {
+  return Math.max(OUTPUT_FRAME_SEC, trackSourceEnd(track) - trackSourceStart(track));
+}
+
+function trackSourceStart(track) {
+  return Math.max(0, Math.min(track.duration, track.track_start ?? 0));
+}
+
+function trackSourceEnd(track) {
   const end = (track.track_end != null && track.track_end < track.duration)
     ? track.track_end : track.duration;
-  return Math.max(1, end);
+  return Math.max(0, Math.min(track.duration, end));
 }
 
 // Returns "Day 2 · clip #47", "day card 2", "title card", or "end card"
@@ -2391,13 +2557,18 @@ function dayBoundaryPositions() {
 
 function updateMusicBlockTitle(div, track, absStart, absEnd) {
   const effectiveDur = trackEffectiveDur(track);
-  const trimmed = effectiveDur < track.duration - 0.5;
+  const sourceStart = trackSourceStart(track);
+  const sourceEnd = trackSourceEnd(track);
+  const trimmed = sourceStart > 0 || sourceEnd < track.duration - OUTPUT_FRAME_SEC / 2;
   const startInfo = filmPositionInfo(absStart);
   const endInfo   = filmPositionInfo(absEnd);
   div.title = `${track.filename}\n` +
-    `Starts: ${fmtMinSec(absStart)}  (${startInfo})\n` +
-    `Ends:   ${fmtMinSec(absEnd)}  (${endInfo})\n` +
-    `Duration: ${effectiveDur.toFixed(1)}s${trimmed ? ' / ' + track.duration.toFixed(1) + 's total' : ''}`;
+    `Start from beginning of track: ${fmtMinSec(sourceStart)}\n` +
+    `Start of selected section in film: ${fmtMinSec(absStart)}  (${startInfo})\n` +
+    `End of selected section in film: ${fmtMinSec(absEnd)}  (${endInfo})\n` +
+    `Source range: ${fmtMinSec(sourceStart)} - ${fmtMinSec(sourceEnd)}\n` +
+    `Duration: ${effectiveDur.toFixed(1)}s${trimmed ? ' / ' + track.duration.toFixed(1) + 's total' : ''}\n` +
+    `Right-click the track to set its source start`;
 }
 
 // ── Strip-px ↔ film-sec mapping ──────────────────────────────────────────────
@@ -2426,8 +2597,8 @@ function buildStripLayout() {
     const sel = state.selections[clip.filename];
     if (day && day !== lastDay) {
       const hasEnabled = enabledDays.has(day);
-      const prevDot = i > 0 && state.clips[i - 1].modified > clip.modified;
-      const nextDot = i < state.clips.length - 1 && clip.modified > state.clips[i + 1].modified;
+      const prevDot = i > 0 && isCrossDayInversion(state.clips[i - 1], clip);
+      const nextDot = i < state.clips.length - 1 && isCrossDayInversion(clip, state.clips[i + 1]);
       if (showDayCards && hasEnabled && (!isFirstDay || !state.projectTitle) && !prevDot && !nextDot) {
         const dd = state.disabledDayCards.has(day);
         if (showSkipped || !dd) push(dd ? 0 : 2, 24, dd);
@@ -2519,11 +2690,13 @@ function saveMusicEnds() {
   _musicDragSaveTimer = setTimeout(() => {
     const ends    = {};
     const offsets = {};
+    const starts  = {};
     state.musicTracks.forEach(t => {
       if (t.track_end    != null && t.track_end    < t.duration) ends[t.filename]    = t.track_end;
       if (t.track_offset != null && t.track_offset > 0)          offsets[t.filename] = t.track_offset;
+      if (t.track_start  != null && t.track_start  > 0)          starts[t.filename]  = t.track_start;
     });
-    api('POST', '/api/music_ends', { music_ends: ends, music_offsets: offsets }).catch(e => console.error('music_ends save error:', e));
+    api('POST', '/api/music_ends', { music_ends: ends, music_offsets: offsets, music_starts: starts }).catch(e => console.error('music_ends save error:', e));
   }, 400);
 }
 
@@ -2541,8 +2714,7 @@ function bindMusicDragHandle(handle, trackIdx) {
     trackStartSec += state.musicTracks[trackIdx].track_offset ?? 0;
 
     const track   = state.musicTracks[trackIdx];
-    const origEnd = track.track_end != null ? track.track_end : track.duration;
-    const origEndStripPx = filmSecToStripPx(trackStartSec + origEnd);
+    const origEndStripPx = filmSecToStripPx(trackStartSec + trackEffectiveDur(track));
     // Snap targets in strip-px space
     const snapTargets = videoBoundaries().map(sec => filmSecToStripPx(sec));
 
@@ -2559,7 +2731,9 @@ function bindMusicDragHandle(handle, trackIdx) {
       }
 
       const newEndFilmSec = stripPxToFilmSec(newEndStripPx);
-      track.track_end = Math.max(1, Math.min(track.duration, newEndFilmSec - trackStartSec));
+      const newDuration = snapToOutputFrame(newEndFilmSec - trackStartSec);
+      track.track_end = Math.max(trackSourceStart(track) + OUTPUT_FRAME_SEC,
+                                 Math.min(track.duration, trackSourceStart(track) + newDuration));
       updateMusicBar();
     }
 
@@ -2605,8 +2779,8 @@ function bindMusicDragHandleLeft(handle, trackIdx) {
         if (Math.abs(newStartStripPx - b) <= 5) { newStartStripPx = Math.max(prevEndStripPx, b); break; }
       }
 
-      const newOffset = Math.max(0, stripPxToFilmSec(newStartStripPx) - prevEndFilmSec);
-      track.track_offset = newOffset < 0.05 ? 0 : newOffset;
+      const newOffset = snapToOutputFrame(Math.max(0, stripPxToFilmSec(newStartStripPx) - prevEndFilmSec));
+      track.track_offset = newOffset < OUTPUT_FRAME_SEC / 2 ? 0 : newOffset;
       updateMusicBar();
     }
 

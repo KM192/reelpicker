@@ -21,6 +21,7 @@ from urllib.parse import urlparse, unquote
 from socketserver import ThreadingMixIn
 
 PORT = 8000
+OUTPUT_FPS = 30
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 IS_WIN = sys.platform == 'win32'
 _NO_WINDOW = 0x08000000  # Windows: CREATE_NO_WINDOW
@@ -32,6 +33,10 @@ def _find_tool(name):
     if os.path.isfile(local):
         return local
     return name  # fallback: PATH
+
+
+def snap_to_output_frame(seconds):
+    return round(max(0.0, float(seconds)) * OUTPUT_FPS) / OUTPUT_FPS
 
 
 FFMPEG  = _find_tool('ffmpeg')
@@ -429,20 +434,20 @@ def _clip_cache_path(folder, filename, start_time, clip_duration=3.0, location_n
         mtime_ms = 0
     start_ms = int(round(start_time * 1000))
     dur_ms   = int(round(clip_duration * 1000))
-    loc_part = f'_{hashlib.md5(location_name.encode()).hexdigest()[:8]}' if location_name else ''
+    loc_part = f'_{hashlib.md5(("location-v2|" + location_name).encode()).hexdigest()[:8]}' if location_name else ''
     return os.path.join(cache_dir, f'{stem}_{mtime_ms}_{start_ms:09d}_{dur_ms}ms{loc_part}.mp4')
 
 
 def _title_card_cache_path(folder, title, subtitle, title2=''):
     """Return cache path for a title card keyed by title+title2+subtitle content."""
-    h = hashlib.md5(f'{title}|{title2}|{subtitle}'.encode()).hexdigest()[:12]
+    h = hashlib.md5(f'title-card-v3|{title}|{title2}|{subtitle}'.encode()).hexdigest()[:12]
     return os.path.join(folder, '.clip_cache', f'title_{h}.mp4')
 
 
 def _end_card_cache_path(folder, title='', subtitle=''):
     """Return cache path for the end card, keyed by custom title/subtitle if provided."""
     if title or subtitle:
-        h = hashlib.md5(f'{title}|{subtitle}'.encode()).hexdigest()[:12]
+        h = hashlib.md5(f'end-card-v2|{title}|{subtitle}'.encode()).hexdigest()[:12]
         return os.path.join(folder, '.clip_cache', f'end_card_{h}.mp4')
     return os.path.join(folder, '.clip_cache', 'end_card.mp4')
 
@@ -464,9 +469,9 @@ def _day_card_cache_path(folder, date_str, custom_title='', custom_subtitle=''):
     """Return cache path for a day separator card.  Includes a hash of any
     custom title/subtitle so changing the text automatically invalidates cache."""
     if custom_title or custom_subtitle:
-        h = hashlib.md5(f'{custom_title}|{custom_subtitle}'.encode()).hexdigest()[:8]
+        h = hashlib.md5(f'day-card-v3|{custom_title}|{custom_subtitle}'.encode()).hexdigest()[:8]
         return os.path.join(folder, '.clip_cache', f'day_{date_str}_{h}.mp4')
-    return os.path.join(folder, '.clip_cache', f'day_{date_str}.mp4')
+    return os.path.join(folder, '.clip_cache', f'day_{date_str}_v3.mp4')
 
 
 def _delete_day_card_cache(folder, date_str):
@@ -488,7 +493,8 @@ DAYS_PL = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', '
 
 def load_selections(folder):
     """Returns (selections_dict, title, subtitle, title2, disabled_day_cards, day_card_titles,
-    end_card_title, end_card_subtitle, music_ends, music_offsets, clip_order, clip_duration, has_saved).
+    end_card_title, end_card_subtitle, music_ends, music_offsets, music_starts,
+    clip_order, clip_duration, has_saved).
     music_ends: dict filename->track_end_seconds.
     music_offsets: dict filename->track_offset_seconds (silence before track in film timeline).
     clip_order: list of filenames in user-defined order (empty = use default mtime order).
@@ -507,31 +513,41 @@ def load_selections(folder):
                 end_sub       = data.get('end_card_subtitle', '')
                 music_ends    = data.get('music_ends', {})
                 music_offsets = data.get('music_offsets', data.get('music_starts', {}))  # back-compat
+                music_starts  = data.get('music_trim_starts', {})
                 clip_order    = data.get('clip_order', [])
                 clip_dur      = float(data.get('clip_duration', 3.0))
                 return (sel, data.get('title', ''), data.get('subtitle', ''), data.get('title2', ''),
-                        disabled, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, True)
+                        disabled, day_titles, end_title, end_sub, music_ends, music_offsets, music_starts,
+                        clip_order, clip_dur, True)
         except Exception as e:
             print(f'Load selections error: {e}')
-    return {}, '', '', '', set(), {}, '', '', {}, {}, [], 3.0, False
+    return {}, '', '', '', set(), {}, '', '', {}, {}, {}, [], 3.0, False
 
 
-def save_selections(folder, selections, title='', subtitle='', disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', music_ends=None, music_offsets=None, clip_order=None, clip_duration=3.0, title2=''):
+def save_selections(folder, selections, title='', subtitle='', disabled_day_cards=None, day_card_titles=None, end_card_title='', end_card_subtitle='', music_ends=None, music_offsets=None, music_starts=None, clip_order=None, clip_duration=3.0, title2=None):
     path = os.path.join(folder, 'selections.json')
+    existing = {}
+    if os.path.isfile(path) and (music_ends is None or music_offsets is None or music_starts is None or title2 is None):
+        try:
+            with open(path, encoding='utf-8') as f:
+                existing = json.load(f)
+        except Exception:
+            pass
     data = {
         'source_folder': folder,
         'created': datetime.datetime.now().isoformat(),
         'clip_duration': clip_duration,
         'title': title,
-        'title2': title2,
+        'title2': existing.get('title2', '') if title2 is None else title2,
         'subtitle': subtitle,
         'selections': list(selections.values()),
         'disabled_day_cards': sorted(disabled_day_cards or []),
         'day_card_titles': day_card_titles or {},
         'end_card_title': end_card_title,
         'end_card_subtitle': end_card_subtitle,
-        'music_ends': music_ends or {},
-        'music_offsets': music_offsets or {},
+        'music_ends': existing.get('music_ends', {}) if music_ends is None else music_ends,
+        'music_offsets': existing.get('music_offsets', {}) if music_offsets is None else music_offsets,
+        'music_trim_starts': existing.get('music_trim_starts', {}) if music_starts is None else music_starts,
         'clip_order': clip_order or [],
     }
     try:
@@ -625,8 +641,9 @@ def esc_drawtext(s):
 
 def _sq(s):
     """Escape text for a single-quoted drawtext option value ('...').
-    Only ' needs escaping (via '\\'' pattern); % needs doubling for drawtext."""
-    return s.replace("'", "'\\''").replace('%', '%%')
+    Use a typographic apostrophe because FFmpeg's filter parser cannot reliably retain
+    an ASCII apostrophe inside a quoted drawtext value passed without a shell."""
+    return s.replace("'", '\u2019').replace('%', '%%')
 
 
 def _esc_font(path):
@@ -665,6 +682,39 @@ def find_icon_font():
     return None
 
 
+def _card_text_width(text):
+    """Approximate Segoe UI text width in average-character units."""
+    narrow = " ilI.,'!|:;[]()"
+    wide = 'MW@#%&QO'
+    return sum(0.45 if char in narrow else 1.35 if char in wide else 1.0 for char in text)
+
+
+def _wrap_card_text(text, max_width=19.0):
+    """Wrap card text to a safe 1080px drawtext width, splitting long words if needed."""
+    lines = []
+    for paragraph in (text or '').strip().splitlines() or ['']:
+        words = paragraph.split()
+        current = ''
+        for word in words:
+            candidate = f'{current} {word}'.strip()
+            if current and _card_text_width(candidate) > max_width:
+                lines.append(current)
+                current = ''
+            while _card_text_width(word) > max_width:
+                split_at = 1
+                while split_at < len(word) and _card_text_width(word[:split_at + 1]) <= max_width:
+                    split_at += 1
+                if current:
+                    lines.append(current)
+                    current = ''
+                lines.append(word[:split_at])
+                word = word[split_at:]
+            current = f'{current} {word}'.strip()
+        if current:
+            lines.append(current)
+    return lines
+
+
 def generate_title_card(title, subtitle, out_path, title2=''):
     """Generate 4-second title card MP4 (1080x1920).
     Play icon visible 0-1s, title+subtitle visible 0-3s (static, no animation).
@@ -685,11 +735,14 @@ def generate_title_card(title, subtitle, out_path, title2=''):
     # Segoe UI Symbol / MDL2 have ⏵ (U+23F5); everything else uses ▶ (U+25B6)
     icon_char  = '\u23f5' if ('seguisym' in name_lower or 'segmdl2' in name_lower) else '\u25b6'
 
-    has_title2 = bool(title2.strip())
-
-    # Two title lines: shift block up so it stays centred vertically in the frame
-    title_y    = 970  if has_title2 else 1020
-    subtitle_y = 1190 if has_title2 else 1140
+    title_lines = _wrap_card_text(title)
+    if title2.strip():
+        title_lines.extend(_wrap_card_text(title2.strip()))
+    title_font_size = 90 if len(title_lines) <= 2 else 82 if len(title_lines) == 3 else 72
+    title_line_step = title_font_size + (15 if title_font_size == 90 else 14 if title_font_size == 82 else 12)
+    title_block_height = title_font_size + max(0, len(title_lines) - 1) * title_line_step
+    title_y = round(1065 - title_block_height / 2)
+    subtitle_y = title_y + title_block_height + (30 if len(title_lines) == 1 else 25)
 
     # All drawtext text= values are single-quoted — inside '...' only '
     # is special (escaped via '\''); parens, colons etc. are literal.
@@ -697,19 +750,18 @@ def generate_title_card(title, subtitle, out_path, title2=''):
     vf_parts = [
         f"drawtext=fontfile={icon_name}:text='{icon_char}':fontsize=320:"
         f"fontcolor=white:x=(w-tw)/2:y=580:enable=lt(t\\,1)",
-        f"drawtext=fontfile={text_name}:text='{_sq(title)}':fontsize=90:"
-        f"fontcolor=white:x=(w-tw)/2:y={title_y}:enable=lt(t\\,3)",
     ]
-    if has_title2:
+    for line_idx, line in enumerate(title_lines):
         vf_parts.append(
-            f"drawtext=fontfile={text_name}:text='{_sq(title2.strip())}':fontsize=90:"
-            f"fontcolor=white:x=(w-tw)/2:y={title_y + 105}:enable=lt(t\\,3)"
+            f"drawtext=fontfile={text_name}:text='{_sq(line)}':fontsize={title_font_size}:"
+            f"fontcolor=white:x=(w-tw)/2:y={title_y + line_idx * title_line_step}:enable=lt(t\\,3)"
         )
     if subtitle.strip():
-        vf_parts.append(
-            f"drawtext=fontfile={text_name}:text='{_sq(subtitle.strip())}':fontsize=60:"
-            f"fontcolor=white:x=(w-tw)/2:y={subtitle_y}:enable=lt(t\\,3)"
-        )
+        for line_idx, line in enumerate(_wrap_card_text(subtitle.strip(), max_width=28.0)):
+            vf_parts.append(
+                f"drawtext=fontfile={text_name}:text='{_sq(line)}':fontsize=60:"
+                f"fontcolor=white:x=(w-tw)/2:y={subtitle_y + line_idx * 70}:enable=lt(t\\,3)"
+            )
 
     cmd = [
         FFMPEG, '-y',
@@ -798,15 +850,25 @@ def generate_day_card(date_str, day_name, out_path, title_override='', subtitle_
     # Sub text: custom subtitle overrides the day name
     sub_text = subtitle_override if subtitle_override else day_name
 
-    vf_parts = [
-        f"drawtext=fontfile={font_name}:text='{_sq(main_text)}':fontsize=96:"
-        f"fontcolor=white:x=(w-tw)/2:y=(h-th)/2-50",
-    ]
-    if sub_text:
+    main_lines = _wrap_card_text(main_text)
+    main_font_size = 96 if len(main_lines) == 1 else 84 if len(main_lines) == 2 else 72
+    main_line_step = main_font_size + 14
+    main_block_height = main_font_size + max(0, len(main_lines) - 1) * main_line_step
+    main_y = round(910 - main_block_height / 2)
+    subtitle_y = main_y + main_block_height + 42
+
+    vf_parts = []
+    for line_idx, line in enumerate(main_lines):
         vf_parts.append(
-            f"drawtext=fontfile={font_name}:text='{_sq(sub_text)}':fontsize=60:"
-            f"fontcolor=#aaaaaa:x=(w-tw)/2:y=(h-th)/2+70"
+            f"drawtext=fontfile={font_name}:text='{_sq(line)}':fontsize={main_font_size}:"
+            f"fontcolor=white:x=(w-tw)/2:y={main_y + line_idx * main_line_step}"
         )
+    if sub_text:
+        for line_idx, line in enumerate(_wrap_card_text(sub_text, max_width=28.0)):
+            vf_parts.append(
+                f"drawtext=fontfile={font_name}:text='{_sq(line)}':fontsize=60:"
+                f"fontcolor=#aaaaaa:x=(w-tw)/2:y={subtitle_y + line_idx * 70}"
+            )
 
     cmd = [
         FFMPEG, '-y',
@@ -840,8 +902,8 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
         print('WARN: Cannot read video duration – skipping music')
         return None
 
-    fade_dur   = min(10.0, video_dur)
-    fade_start = max(0.0, video_dur - fade_dur)
+    final_fade_dur = min(10.0, video_dur)
+    fade_start = max(0.0, video_dur - final_fade_dur)
 
     music_paths = [os.path.join(music_dir, t['filename']) for t in music_tracks]
     n = len(music_paths)
@@ -853,20 +915,21 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
     # Build filter_complex: trim each track to track_end, add 3s fade-out, silence offset, concat, mix with video
     parts = []
     processed = []
-    fade_dur = 3.0
+    track_fade_dur = 3.0
     for i, t in enumerate(music_tracks):
         src    = f'[{i+1}:a]'
         label  = f'[mus_t{i}]'
-        te     = t.get('track_end')
-        offset = t.get('track_offset') or 0
-        filters = []
-        # Trim to track_end
-        if te is not None and te < t['duration']:
-            filters.append(f'atrim=0:{te:.3f},asetpts=PTS-STARTPTS')
-        # Fade out at end of the track segment (3s before trim end or track duration)
+        te     = snap_to_output_frame(t['track_end']) if t.get('track_end') is not None else None
+        ts     = snap_to_output_frame(t.get('track_start') or 0)
+        offset = snap_to_output_frame(t.get('track_offset') or 0)
         track_end_actual = te if te is not None and te < t['duration'] else t['duration']
-        f_start = max(0.0, track_end_actual - fade_dur)
-        filters.append(f'afade=t=out:st={f_start:.3f}:d={fade_dur:.3f}')
+        ts = min(ts, max(0.0, track_end_actual - (1.0 / OUTPUT_FPS)))
+        filters = [f'atrim={ts:.6f}:{track_end_actual:.6f}', 'asetpts=PTS-STARTPTS']
+        # Fade out at end of the track segment (3s before trim end or track duration)
+        segment_dur = track_end_actual - ts
+        actual_track_fade = min(track_fade_dur, segment_dur)
+        f_start = max(0.0, segment_dur - actual_track_fade)
+        filters.append(f'afade=t=out:st={f_start:.6f}:d={actual_track_fade:.6f}')
         # Silence offset before the track in the film timeline
         if offset > 0:
             delay_ms = int(round(offset * 1000))
@@ -885,7 +948,7 @@ def _add_music_to_video(folder, video_path, out_path, music_tracks):
         prefix = '[mus_raw]'
 
     trim_filter = (f'{prefix}atrim=0:{video_dur:.3f},asetpts=PTS-STARTPTS,'
-                   f'afade=t=out:st={fade_start:.3f}:d={fade_dur:.3f}[mus]')
+                    f'afade=t=out:st={fade_start:.3f}:d={final_fade_dur:.3f}[mus]')
     mix_filter  = '[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[audio_out]'
 
     parts.extend([trim_filter, mix_filter])
@@ -1172,7 +1235,7 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
         )
 
         set_status('working', f'Merging {len(concat_list)} segments...', 86)
-        merge_cmd = [FFMPEG, '-y', '-f', 'concat', '-safe', '0', '-i', flist,
+        merge_cmd = [FFMPEG, '-y', '-loglevel', 'info', '-f', 'concat', '-safe', '0', '-i', flist,
                      '-c', 'copy', '-progress', 'pipe:1', '-nostats', concat_path]
         merge_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if IS_WIN:
@@ -1185,13 +1248,17 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
         stderr_buf = []
         def _drain():
             try:
-                for chunk in iter(lambda: proc.stderr.read(4096), b''):
-                    stderr_buf.append(chunk)
+                for raw_line in iter(proc.stderr.readline, b''):
+                    stderr_buf.append(raw_line)
+                    line = raw_line.decode('utf-8', errors='replace').rstrip()
+                    if line:
+                        print(f'  [ffmpeg merge] {line}', flush=True)
             except Exception:
                 pass
         t_err = threading.Thread(target=_drain, daemon=True)
         t_err.start()
 
+        last_reported_merge_pct = -5
         try:
             for raw in proc.stdout:
                 if cancelled():
@@ -1205,10 +1272,17 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
                         us = int(line.split('=', 1)[1])
                         if total_merge_dur > 0 and us > 0:
                             frac = min(us / 1_000_000 / total_merge_dur, 1.0)
+                            merge_pct = int(frac * 100)
                             pct  = int(86 + frac * 6)
                             set_status('working',
-                                       f'Merging {len(concat_list)} segments... {int(frac * 100)}%',
+                                       f'Merging {len(concat_list)} segments... {merge_pct}%',
                                        pct)
+                            if merge_pct >= last_reported_merge_pct + 5 or merge_pct == 100:
+                                estimated_segments = min(len(concat_list), round(frac * len(concat_list)))
+                                print(f'  Merge progress: {merge_pct}% '
+                                      f'(~{estimated_segments}/{len(concat_list)} segments, '
+                                      f'{us / 1_000_000:.1f}/{total_merge_dur:.1f}s)', flush=True)
+                                last_reported_merge_pct = merge_pct
                     except (ValueError, IndexError):
                         pass
         except Exception as e:
@@ -1228,6 +1302,7 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
             msg = err.decode('utf-8', errors='replace')[-400:]
             set_status('error', f'Merging error: {msg}', 0)
             return
+        set_status('working', 'Finalizing merged file...', 92)
     else:
         print(f'  [cache] concat: {len(concat_list)} segments')
 
@@ -1235,22 +1310,17 @@ def export_worker(folder, clips, selections, out_name, title='', subtitle='', mu
         import shutil
         if concat_cache != out_path:
             shutil.copy2(concat_cache, out_path)
-        return
-
-    set_status('working', 'Adding music...', 92)
-    result = _add_music_to_video(folder, concat_cache, out_path, music_tracks)
-    if result:
-        try:
-            os.remove(concat_cache)
-        except Exception:
-            pass
     else:
-        # Fallback: use concat result without music
-        try:
-            os.replace(concat_cache, out_path)
-        except Exception:
-            pass
-        print('WARN: Music was not added – film saved without music')
+        set_status('working', 'Adding music...', 92)
+        result = _add_music_to_video(folder, concat_cache, out_path, music_tracks)
+        if not result:
+            # Keep the reusable concat cache and copy it as a music-free fallback.
+            import shutil
+            try:
+                shutil.copy2(concat_cache, out_path)
+            except Exception:
+                pass
+            print('WARN: Music was not added – film saved without music')
 
     # Embed title card thumbnail as cover art so Windows Explorer shows it
     if EMBED_THUMBNAIL and title_file:
@@ -1473,7 +1543,7 @@ class Handler(BaseHTTPRequestHandler):
             if not clips:
                 self.send_json({'error': 'No MP4 files found in folder'}, 400)
                 return
-            sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
+            sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, music_starts, clip_order, clip_dur, has_saved = load_selections(folder)
             if not has_saved:
                 # First load – apply defaults: title = folder basename, subtitle = date of first clip
                 title = os.path.basename(folder.rstrip('/\\'))
@@ -1486,12 +1556,14 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             clips = apply_clip_order(clips, clip_order)
             music = scan_music(folder)
-            # Apply saved track_end and track_offset values to music tracks
+            # Apply saved trim and timeline offset values to music tracks
             for t in music:
                 if t['filename'] in music_ends:
                     t['track_end'] = float(music_ends[t['filename']])
                 if t['filename'] in music_offsets:
                     t['track_offset'] = float(music_offsets[t['filename']])
+                if t['filename'] in music_starts:
+                    t['track_start'] = float(music_starts[t['filename']])
             with state_lock:
                 state['folder']             = folder
                 state['clips']              = clips
@@ -1693,20 +1765,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({'ok': True})
 
         elif path == '/api/music_ends':
-            # music_ends: {filename: track_end_seconds}, music_offsets: {filename: track_offset_seconds}
+            # Source trim range and silence before each track on the film timeline.
             ends    = data.get('music_ends', {})
             offsets = data.get('music_offsets', {})
+            starts  = data.get('music_starts', {})
             with state_lock:
                 for track in state['music']:
                     fname = track['filename']
                     if fname in ends:
-                        track['track_end'] = float(ends[fname])
+                        track['track_end'] = min(track['duration'], snap_to_output_frame(ends[fname]))
                     elif 'track_end' in track:
                         del track['track_end']
                     if fname in offsets:
-                        track['track_offset'] = float(offsets[fname])
+                        track['track_offset'] = snap_to_output_frame(offsets[fname])
                     elif 'track_offset' in track:
                         del track['track_offset']
+                    if fname in starts:
+                        source_end = track.get('track_end', track['duration'])
+                        track['track_start'] = min(snap_to_output_frame(starts[fname]),
+                                                   max(0.0, source_end - (1.0 / OUTPUT_FPS)))
+                    elif 'track_start' in track:
+                        del track['track_start']
                 folder     = state['folder']
                 sel_copy   = dict(state['selections'])
                 title      = state['title']
@@ -1718,9 +1797,12 @@ class Handler(BaseHTTPRequestHandler):
                 clip_dur   = state['clip_duration']
                 music_ends_save    = {t['filename']: t['track_end']    for t in state['music'] if 'track_end'    in t}
                 music_offsets_save = {t['filename']: t['track_offset'] for t in state['music'] if 'track_offset' in t}
+                music_starts_save  = {t['filename']: t['track_start']  for t in state['music'] if 'track_start'  in t}
                 cur_order  = [c['filename'] for c in state['clips']]
             if folder:
-                save_selections(folder, sel_copy, title, subtitle, disabled, day_titles, end_title, end_sub, music_ends_save, music_offsets_save, clip_order=cur_order, clip_duration=clip_dur)
+                save_selections(folder, sel_copy, title, subtitle, disabled, day_titles, end_title, end_sub,
+                                music_ends_save, music_offsets_save, music_starts_save,
+                                clip_order=cur_order, clip_duration=clip_dur)
             self.send_json({'ok': True})
 
         elif path == '/api/clip_order':
@@ -2061,7 +2143,7 @@ def main():
         if not clips:
             print(f'ERROR: No MP4 files in: {folder}')
             sys.exit(1)
-        sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, clip_order, clip_dur, has_saved = load_selections(folder)
+        sel, title, subtitle, title2, disabled_days, day_titles, end_title, end_sub, music_ends, music_offsets, music_starts, clip_order, clip_dur, has_saved = load_selections(folder)
         if not has_saved:
             title    = os.path.basename(folder.rstrip('/\\'))
             clip_dur = 3.0
@@ -2073,7 +2155,7 @@ def main():
                 pass
         clips = apply_clip_order(clips, clip_order)
         music = scan_music(folder)
-        # Apply saved track_end and track_offset values to music tracks
+        # Apply saved trim and timeline offset values to music tracks
         print(f'DEBUG: music_ends={json.dumps(music_ends)}')
         for t in music:
             if t['filename'] in music_ends:
@@ -2082,6 +2164,8 @@ def main():
                 t['track_end'] = val
             if t['filename'] in music_offsets:
                 t['track_offset'] = float(music_offsets[t['filename']])
+            if t['filename'] in music_starts:
+                t['track_start'] = float(music_starts[t['filename']])
         with state_lock:
             state['folder']             = folder
             state['clips']              = clips
